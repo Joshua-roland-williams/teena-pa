@@ -58,9 +58,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_first_name = update.effective_user.first_name
     welcome_text = (
         f"Hey {user_first_name}! 👋\n\n"
-        "I'm *Teena*, your personal assistant bot.\n"
-        "I'm still learning new tricks, but go ahead and send me a message — "
-        "I'll echo it back for now so you know the pipeline is working!"
+        "I'm *Teena*, your personal assistant bot.\n\n"
+        "Here's what I can do so far:\n"
+        "• `/addtask <text>` — add a task\n"
+        "• `/tasks` — see your open tasks\n"
+        "• `/done <id>` — mark a task complete\n\n"
+        "More is on the way — Calendar sync, mood tracking, and real conversation are coming soon!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     logger.info("Sent welcome message to %s", user_first_name)
@@ -181,13 +184,19 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------------------------------------------------------------
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any plain text message — echo it back (placeholder logic)."""
-    user_text = update.message.text
-    await update.message.reply_text(f"You said: {user_text}")
+    """Handle any plain text message — placeholder until real chat (Phase 4) is built."""
+    await update.message.reply_text(
+        "I can't chat freely just yet — that's coming soon! 🙂\n"
+        "For now, try:\n"
+        "• `/addtask <text>`\n"
+        "• `/tasks`\n"
+        "• `/done <id>`",
+        parse_mode="Markdown",
+    )
     logger.info(
-        "Echoed message from %s: %s",
+        "Received free-text from %s (chat not yet implemented): %s",
         update.effective_user.first_name,
-        user_text,
+        update.message.text,
     )
 
 # ---------------------------------------------------------------------------
