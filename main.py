@@ -27,6 +27,9 @@ from telegram.ext import (
 # Import our database helpers from database.py
 from database import init_db, add_task, get_open_tasks, mark_task_done
 
+# Import the Google Calendar helper for the /agenda command
+from calendar_helper import get_today_events
+
 # ---------------------------------------------------------------------------
 # 1. Load environment variables from .env
 # ---------------------------------------------------------------------------
@@ -62,8 +65,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Here's what I can do so far:\n"
         "• `/addtask <text>` — add a task\n"
         "• `/tasks` — see your open tasks\n"
-        "• `/done <id>` — mark a task complete\n\n"
-        "More is on the way — Calendar sync, mood tracking, and real conversation are coming soon!"
+        "• `/done <id>` — mark a task complete\n"
+        "• `/agenda` — see today's calendar events\n\n"
+        "More is on the way — mood tracking and real conversation are coming soon!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     logger.info("Sent welcome message to %s", user_first_name)
@@ -180,6 +184,64 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# Calendar / agenda command handler
+# ---------------------------------------------------------------------------
+
+async def agenda_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /agenda — show today's Google Calendar events.
+
+    Calls get_today_events() which returns a list of dicts with keys:
+    summary, start, end.  Wraps the call in try/except so that
+    credential issues or API errors never crash the bot.
+    """
+
+    try:
+        events = get_today_events()
+    except FileNotFoundError as exc:
+        # credentials.json is missing — tell the user, log the real error
+        logger.error("Calendar credentials missing: %s", exc)
+        await update.message.reply_text(
+            "⚠️ Calendar credentials are not set up yet.\n"
+            "Please add your `credentials.json` file and try again.",
+            parse_mode="Markdown",
+        )
+        return
+    except Exception as exc:
+        # Any other Google API or network error
+        logger.error("Failed to fetch calendar events: %s", exc, exc_info=True)
+        await update.message.reply_text(
+            "⚠️ Sorry, I couldn't fetch your calendar right now.\n"
+            "Please try again later.",
+        )
+        return
+
+    # No events today
+    if not events:
+        await update.message.reply_text(
+            "You have no events today — clear schedule! 🎉"
+        )
+        logger.info("No calendar events today for %s", update.effective_user.first_name)
+        return
+
+    # Build a formatted agenda list
+    lines = ["📅 *Today's agenda:*\n"]
+    for event in events:
+        # All-day events show "All day" instead of a time range
+        if event["start"] == "All day":
+            lines.append(f"  🔹 {event['summary']}  _(all day)_")
+        else:
+            lines.append(f"  🔹 {event['start']} – {event['end']}  {event['summary']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    logger.info(
+        "Showed %d calendar event(s) to %s",
+        len(events),
+        update.effective_user.first_name,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Echo handler (catch-all for plain text)
 # ---------------------------------------------------------------------------
 
@@ -221,6 +283,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addtask", addtask_command))
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
+    app.add_handler(CommandHandler("agenda", agenda_command))  # Calendar agenda
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
     # Start polling — the bot will keep running until you press Ctrl+C
