@@ -56,6 +56,27 @@ def init_db():
             );
         """)
 
+        # --- tasks table migration ---
+        # If the database already exists from an earlier version, it won't
+        # have the newer columns (priority, category, completed_at).
+        # CREATE TABLE IF NOT EXISTS won't add them retroactively, so we
+        # check which columns currently exist and ALTER TABLE to add any
+        # that are missing.  This is safe to run repeatedly — once a
+        # column exists, it simply won't be added again.
+        cursor.execute("PRAGMA table_info(tasks);")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # Map of column_name -> full ALTER TABLE statement
+        migrations = {
+            "priority": "ALTER TABLE tasks ADD COLUMN priority TEXT DEFAULT 'medium';",
+            "category": "ALTER TABLE tasks ADD COLUMN category TEXT;",
+            "completed_at": "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP;",
+        }
+
+        for col_name, alter_sql in migrations.items():
+            if col_name not in existing_columns:
+                cursor.execute(alter_sql)
+
         # --- mood_logs table ---
         # Tracks the user's mood over time.
         #   • score  – a numeric mood rating (e.g. 1–10)
@@ -104,7 +125,7 @@ def init_db():
 # Task helper functions
 # ---------------------------------------------------------------------------
 
-def add_task(text, due_date=None):
+def add_task(text, due_date=None, priority="medium", category=None):
     """
     Insert a new task and return its id.
 
@@ -114,6 +135,10 @@ def add_task(text, due_date=None):
         The task description (e.g. "Buy groceries").
     due_date : str or None
         Optional deadline as a string (e.g. "2026-07-15").
+    priority : str
+        Task priority — one of 'low', 'medium', 'high' (default 'medium').
+    category : str or None
+        Optional free-text category (e.g. "work", "personal", "health").
 
     Returns
     -------
@@ -127,8 +152,8 @@ def add_task(text, due_date=None):
         # Using parameterised queries (the ? placeholders) prevents
         # SQL injection — NEVER use f-strings or .format() for SQL values!
         cursor.execute(
-            "INSERT INTO tasks (text, due_date) VALUES (?, ?);",
-            (text, due_date),
+            "INSERT INTO tasks (text, due_date, priority, category) VALUES (?, ?, ?, ?);",
+            (text, due_date, priority, category),
         )
         conn.commit()
 
@@ -145,7 +170,8 @@ def get_open_tasks():
     Returns
     -------
     list of dict
-        Each dict has keys: id, text, due_date, done, created_at.
+        Each dict has keys: id, text, due_date, done, created_at,
+        priority, category, completed_at.
         Results are ordered from oldest to newest.
     """
 
@@ -167,7 +193,8 @@ def get_open_tasks():
 
 def mark_task_done(task_id):
     """
-    Mark a task as completed by setting done = 1.
+    Mark a task as completed by setting done = 1 and recording
+    the completion timestamp in completed_at.
 
     Parameters
     ----------
@@ -184,14 +211,15 @@ def mark_task_done(task_id):
     with sqlite3.connect(DATABASE_NAME) as conn:
         cursor = conn.cursor()
 
+        # Set done = 1 and stamp the completion time
         cursor.execute(
-            "UPDATE tasks SET done = 1 WHERE id = ?;",
-            (task_id,),
+            "UPDATE tasks SET done = 1, completed_at = ? WHERE id = ? AND done = 0;",
+            (datetime.now().isoformat(), task_id),
         )
         conn.commit()
 
         # `rowcount` tells us how many rows the UPDATE affected.
-        # If it's 0, no task with that id exists.
+        # If it's 0, no open task with that id exists.
         return cursor.rowcount > 0
 
 
