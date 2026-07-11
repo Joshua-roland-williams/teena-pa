@@ -6,7 +6,8 @@ This is the entry point for the bot. It handles:
   • /addtask  → adds a new task to the database
   • /tasks    → lists all open (incomplete) tasks
   • /done     → marks a task as completed by its id
-  • Any text  → echoes it back (placeholder for real AI logic later)
+  • /agenda   → shows today's Google Calendar events
+  • Any text  → Gemini-powered conversational chat
 
 Uses python-telegram-bot v21.x (async style) with polling.
 """
@@ -25,10 +26,13 @@ from telegram.ext import (
 )
 
 # Import our database helpers from database.py
-from database import init_db, add_task, get_open_tasks, mark_task_done
+from database import init_db, add_task, get_open_tasks, mark_task_done, save_message, get_recent_messages
 
 # Import the Google Calendar helper for the /agenda command
 from calendar_helper import get_today_events
+
+# Import the Gemini LLM helper for conversational chat
+from llm_helper import generate_reply
 
 # ---------------------------------------------------------------------------
 # 1. Load environment variables from .env
@@ -67,7 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/tasks` — see your open tasks\n"
         "• `/done <id>` — mark a task complete\n"
         "• `/agenda` — see today's calendar events\n\n"
-        "More is on the way — mood tracking and real conversation are coming soon!"
+        "Or just send me a message and let's chat! 💬"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     logger.info("Sent welcome message to %s", user_first_name)
@@ -242,24 +246,51 @@ async def agenda_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
-# Echo handler (catch-all for plain text)
+# Chat handler — Gemini-powered conversational replies
 # ---------------------------------------------------------------------------
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any plain text message — placeholder until real chat (Phase 4) is built."""
-    await update.message.reply_text(
-        "I can't chat freely just yet — that's coming soon! 🙂\n"
-        "For now, try:\n"
-        "• `/addtask <text>`\n"
-        "• `/tasks`\n"
-        "• `/done <id>`",
-        parse_mode="Markdown",
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle any plain text message with a Gemini-powered reply.
+
+    Flow:
+      1. Save the user's message to the database.
+      2. Gather context: open tasks, today's calendar, recent history.
+      3. Call generate_reply() to get Teena's response.
+      4. Send the reply and save it to the database.
+    """
+    user_text = update.message.text
+    user_name = update.effective_user.first_name
+
+    # Step 1 — Persist the incoming user message
+    save_message("user", user_text)
+
+    # Step 2 — Gather context for the LLM
+    open_tasks = get_open_tasks()
+
+    # Calendar may fail (missing credentials, network issue, etc.).
+    # If it does, we just pass an empty list so chat still works.
+    try:
+        today_events = get_today_events()
+    except Exception as exc:
+        logger.warning("Could not fetch calendar for chat context: %s", exc)
+        today_events = []
+
+    recent_messages = get_recent_messages(limit=10)
+
+    # Step 3 — Generate a reply from Gemini
+    reply = generate_reply(
+        user_message=user_text,
+        open_tasks=open_tasks,
+        today_events=today_events,
+        recent_messages=recent_messages,
     )
-    logger.info(
-        "Received free-text from %s (chat not yet implemented): %s",
-        update.effective_user.first_name,
-        update.message.text,
-    )
+
+    # Step 4 — Send the reply back to the user and persist it
+    await update.message.reply_text(reply)
+    save_message("assistant", reply)
+
+    logger.info("Chat with %s — user: %s | reply: %s", user_name, user_text[:80], reply[:80])
 
 # ---------------------------------------------------------------------------
 # 4. Build the application and start polling
@@ -284,7 +315,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("agenda", agenda_command))  # Calendar agenda
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))  # Gemini chat
 
     # Start polling — the bot will keep running until you press Ctrl+C
     logger.info("Bot is polling for updates… Press Ctrl+C to stop.")

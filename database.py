@@ -196,6 +196,64 @@ def mark_task_done(task_id):
 
 
 # ---------------------------------------------------------------------------
+# Message history helper functions
+# ---------------------------------------------------------------------------
+
+def save_message(role: str, content: str) -> None:
+    """
+    Save a single chat message to the messages table.
+
+    Parameters
+    ----------
+    role : str
+        Either 'user' or 'assistant'.
+    content : str
+        The message text.
+    """
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO messages (role, content) VALUES (?, ?);",
+            (role, content),
+        )
+        conn.commit()
+
+
+def get_recent_messages(limit: int = 10) -> list[dict]:
+    """
+    Fetch the most recent conversation messages, oldest-first.
+
+    We query the last `limit` rows by id (descending), then reverse
+    them so the caller gets chronological order — exactly what the
+    LLM needs to understand the flow of conversation.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of messages to return (default 10).
+
+    Returns
+    -------
+    list of dict
+        Each dict has keys: role ('user' or 'assistant'), content (str).
+    """
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Grab the N most recent rows (newest first), then reverse
+        cursor.execute(
+            "SELECT role, content FROM messages ORDER BY id DESC LIMIT ?;",
+            (limit,),
+        )
+        rows = [{"role": row["role"], "content": row["content"]} for row in cursor.fetchall()]
+
+    # Reverse so oldest message comes first (chronological order)
+    rows.reverse()
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Quick self-test
 # ---------------------------------------------------------------------------
 # Running this file directly (python database.py) will initialise the DB
