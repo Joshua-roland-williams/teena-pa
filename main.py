@@ -31,8 +31,8 @@ from database import init_db, add_task, get_open_tasks, mark_task_done, save_mes
 # Import the Google Calendar helper for the /agenda command
 from calendar_helper import get_today_events
 
-# Import the Gemini LLM helper for conversational chat
-from llm_helper import generate_reply
+# Import the Gemini LLM helper for conversational chat and intent detection
+from llm_helper import generate_reply, detect_intent
 
 # ---------------------------------------------------------------------------
 # 1. Load environment variables from .env
@@ -251,13 +251,18 @@ async def agenda_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle any plain text message with a Gemini-powered reply.
+    Handle any plain text message — first attempt structured intent detection,
+    then fall back to Gemini-powered conversational chat.
 
     Flow:
       1. Save the user's message to the database.
       2. Gather context: open tasks, today's calendar, recent history.
-      3. Call generate_reply() to get Teena's response.
-      4. Send the reply and save it to the database.
+      3. Call detect_intent() to classify the message as an action or chat.
+      4. Branch on the detected intent:
+         • add_task      → create the task in the DB, reply with confirmation.
+         • complete_task  → validate & mark done, reply with confirmation.
+         • chat (default) → call generate_reply() for a conversational answer.
+      5. Save the assistant's reply to the database.
     """
     user_text = update.message.text
     user_name = update.effective_user.first_name
@@ -267,30 +272,125 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Step 2 — Gather context for the LLM
     open_tasks = get_open_tasks()
-
-    # Calendar may fail (missing credentials, network issue, etc.).
-    # If it does, we just pass an empty list so chat still works.
-    try:
-        today_events = get_today_events()
-    except Exception as exc:
-        logger.warning("Could not fetch calendar for chat context: %s", exc)
-        today_events = []
-
     recent_messages = get_recent_messages(limit=10)
 
-    # Step 3 — Generate a reply from Gemini
-    reply = generate_reply(
-        user_message=user_text,
-        open_tasks=open_tasks,
-        today_events=today_events,
-        recent_messages=recent_messages,
-    )
+    # Step 3 — Detect the user's intent before falling back to normal chat.
+    # detect_intent() always returns a dict with at least {"intent": "chat"}
+    # so it's safe to branch on without extra null checks.
+    intent_data = detect_intent(user_text, open_tasks)
+    intent = intent_data.get("intent", "chat")
 
-    # Step 4 — Send the reply back to the user and persist it
-    await update.message.reply_text(reply)
-    save_message("assistant", reply)
+    # ------------------------------------------------------------------
+    # Step 4 — Branch on the detected intent
+    # ------------------------------------------------------------------
 
-    logger.info("Chat with %s — user: %s | reply: %s", user_name, user_text[:80], reply[:80])
+    if intent == "add_task":
+        # ---- ADD TASK intent ----
+        # Extract the structured fields Gemini returned.  task_text is
+        # required; priority defaults to "medium", category and due_date
+        # default to None — matching the database.add_task() signature.
+        task_text = intent_data.get("task_text", user_text)
+        priority = intent_data.get("priority", "medium")
+        category = intent_data.get("category")
+        due_date = intent_data.get("due_date")
+
+        # Persist the new task in the database
+        new_id = add_task(task_text, due_date=due_date, priority=priority, category=category)
+
+        # Build a natural confirmation message, only mentioning non-default
+        # / non-null fields so it doesn't feel robotic.
+        extras = []
+        if priority and priority != "medium":
+            extras.append(f"priority *{priority}*")
+        if category:
+            extras.append(f"category *{category}*")
+        if due_date:
+            extras.append(f"due *{due_date}*")
+
+        extra_str = (", ".join(extras))
+        if extra_str:
+            reply = f"✅ Added task: *{task_text}* ({extra_str})"
+        else:
+            reply = f"✅ Added task: *{task_text}*"
+
+        await update.message.reply_text(reply, parse_mode="Markdown")
+        save_message("assistant", reply)
+        logger.info(
+            "Intent add_task from %s — created task #%d: %s",
+            user_name, new_id, task_text,
+        )
+
+    elif intent == "complete_task":
+        # ---- COMPLETE TASK intent ----
+        # Gemini returns a task_id it thinks the user is referring to.
+        # We validate it against the open_tasks list we already fetched
+        # to guard against hallucinated or stale ids.
+        target_id = intent_data.get("task_id")
+
+        # Build a set of valid open task ids for fast lookup
+        open_ids = {t["id"] for t in open_tasks}
+
+        if target_id is not None and target_id in open_ids:
+            # ID is valid — mark it done
+            mark_task_done(target_id)
+
+            # Find the task text so we can confirm by name, not just id
+            task_name = next(
+                (t["text"] for t in open_tasks if t["id"] == target_id),
+                f"task #{target_id}",
+            )
+            reply = f"✅ Done! Marked *{task_name}* as complete."
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            save_message("assistant", reply)
+            logger.info(
+                "Intent complete_task from %s — completed task #%d: %s",
+                user_name, target_id, task_name,
+            )
+        else:
+            # ID is missing, invalid, or not in the open tasks list.
+            # Don't silently complete the wrong task — show the list
+            # so the user can clarify.
+            lines = ["🤔 I wasn't sure which task you meant. Here are your open tasks:\n"]
+            if open_tasks:
+                for t in open_tasks:
+                    due = f"  _(due {t['due_date']})_" if t.get("due_date") else ""
+                    lines.append(f"  • [`{t['id']}`] {t['text']}{due}")
+                lines.append("\nYou can say which one, or use `/done <id>`.")
+            else:
+                lines.append("  (You have no open tasks right now.)")
+
+            reply = "\n".join(lines)
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            save_message("assistant", reply)
+            logger.info(
+                "Intent complete_task from %s — could not match task_id=%s",
+                user_name, target_id,
+            )
+
+    else:
+        # ---- CHAT intent (default fallback) ----
+        # No actionable intent detected — use the full conversational
+        # reply pipeline with task, calendar, and history context.
+
+        # Fetch calendar events only for chat replies — add_task and
+        # complete_task branches don't need them, so we skip the network
+        # call in those cases for faster responses.
+        try:
+            today_events = get_today_events()
+        except Exception as exc:
+            logger.warning("Could not fetch calendar for chat context: %s", exc)
+            today_events = []
+
+        reply = generate_reply(
+            user_message=user_text,
+            open_tasks=open_tasks,
+            today_events=today_events,
+            recent_messages=recent_messages,
+        )
+
+        await update.message.reply_text(reply)
+        save_message("assistant", reply)
+        logger.info("Chat with %s — user: %s | reply: %s", user_name, user_text[:80], reply[:80])
 
 # ---------------------------------------------------------------------------
 # 4. Build the application and start polling
