@@ -21,8 +21,11 @@ from googleapiclient.discovery import build
 # Configuration
 # --------------------------------------------------------------------------- #
 
-# Read-only access to the user's calendar
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+# Full read/write access to the user's calendar (needed for creating events).
+# NOTE: If you previously used "calendar.readonly", you MUST delete the
+# existing token.json and re-authorize.  Google requires fresh consent
+# whenever the requested permission level changes.
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Paths are resolved relative to this file's directory (project root)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -152,6 +155,78 @@ def get_today_events():
         })
 
     return parsed
+
+
+# --------------------------------------------------------------------------- #
+# Event Creation
+# --------------------------------------------------------------------------- #
+
+def create_event(
+    summary: str,
+    start_datetime: datetime.datetime,
+    end_datetime: datetime.datetime,
+) -> str:
+    """
+    Insert a new event into the user's primary Google Calendar.
+
+    Parameters
+    ----------
+    summary : str
+        The event title / description.
+    start_datetime : datetime.datetime
+        Timezone-aware start time for the event.
+    end_datetime : datetime.datetime
+        Timezone-aware end time for the event.
+        Must be after start_datetime.
+
+    Returns
+    -------
+    str
+        The Google Calendar event ID of the newly created event.
+
+    Raises
+    ------
+    ValueError
+        If the datetimes are not timezone-aware.
+    RuntimeError
+        If the Google Calendar API call fails for any reason.
+    """
+    # Ensure the caller passed timezone-aware datetimes — the API needs
+    # an explicit timezone offset in the ISO string.
+    if start_datetime.tzinfo is None or end_datetime.tzinfo is None:
+        raise ValueError(
+            "start_datetime and end_datetime must be timezone-aware "
+            "(have tzinfo set).  Use .astimezone() or pass tz= to the "
+            "datetime constructor."
+        )
+
+    # Build the event body per the Calendar API v3 spec.
+    # The isoformat() output already includes the UTC offset (e.g.
+    # "2026-07-12T14:00:00+05:30"), so a separate timeZone field is
+    # unnecessary and could cause errors with non-IANA zone names.
+    event_body = {
+        "summary": summary,
+        "start": {
+            "dateTime": start_datetime.isoformat(),
+        },
+        "end": {
+            "dateTime": end_datetime.isoformat(),
+        },
+    }
+
+    try:
+        service = get_calendar_service()
+        created_event = (
+            service.events()
+            .insert(calendarId="primary", body=event_body)
+            .execute()
+        )
+        return created_event["id"]
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to create calendar event '{summary}': {exc}"
+        ) from exc
 
 
 # --------------------------------------------------------------------------- #

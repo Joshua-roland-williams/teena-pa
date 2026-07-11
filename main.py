@@ -12,6 +12,7 @@ This is the entry point for the bot. It handles:
 Uses python-telegram-bot v21.x (async style) with polling.
 """
 
+import datetime
 import logging
 import os
 
@@ -28,8 +29,8 @@ from telegram.ext import (
 # Import our database helpers from database.py
 from database import init_db, add_task, get_open_tasks, mark_task_done, save_message, get_recent_messages
 
-# Import the Google Calendar helper for the /agenda command
-from calendar_helper import get_today_events
+# Import the Google Calendar helper for the /agenda command and event creation
+from calendar_helper import get_today_events, create_event
 
 # Import the Gemini LLM helper for conversational chat and intent detection
 from llm_helper import generate_reply, detect_intent
@@ -71,7 +72,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/tasks` — see your open tasks\n"
         "• `/done <id>` — mark a task complete\n"
         "• `/agenda` — see today's calendar events\n\n"
-        "Or just send me a message and let's chat! 💬"
+        "Or just send me a message — I can add tasks, schedule "
+        "events, and chat! 💬"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
     logger.info("Sent welcome message to %s", user_first_name)
@@ -366,6 +368,75 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Intent complete_task from %s — could not match task_id=%s",
                 user_name, target_id,
             )
+    elif intent == "add_event":
+        # ---- ADD EVENT intent ----
+        # Gemini extracted: summary, date (YYYY-MM-DD), start_time (HH:MM).
+        # We parse these into timezone-aware datetimes and default to a
+        # 1-hour duration since the intent doesn't include an end time.
+        event_summary = intent_data.get("summary", "New event")
+        date_str = intent_data.get("date")        # e.g. "2026-07-13"
+        time_str = intent_data.get("start_time")  # e.g. "15:00"
+
+        # Both date and time are required — if either is missing, the
+        # intent was probably incomplete.  Fall through to chat so Teena
+        # can ask the user for the missing details.
+        if not date_str or not time_str:
+            reply = generate_reply(
+                user_message=user_text,
+                open_tasks=open_tasks,
+                today_events=[],
+                recent_messages=recent_messages,
+            )
+            await update.message.reply_text(reply)
+            save_message("assistant", reply)
+            logger.info(
+                "Intent add_event from %s — missing date/time, fell back to chat",
+                user_name,
+            )
+        else:
+            try:
+                # Parse the date and time strings into a naive datetime,
+                # then make it timezone-aware using the system's local tz.
+                naive_start = datetime.datetime.strptime(
+                    f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+                )
+                # .astimezone() with no arg uses the system's local timezone
+                local_tz = datetime.datetime.now().astimezone().tzinfo
+                start_dt = naive_start.replace(tzinfo=local_tz)
+
+                # Default duration: 1 hour
+                end_dt = start_dt + datetime.timedelta(hours=1)
+
+                # Create the event via Google Calendar API
+                event_id = create_event(event_summary, start_dt, end_dt)
+
+                # Format the time for a human-friendly confirmation
+                friendly_time = start_dt.strftime("%I:%M %p").lstrip("0")
+                friendly_date = start_dt.strftime("%A, %B %d")
+                reply = (
+                    f"📅 Scheduled: *{event_summary}*\n"
+                    f"{friendly_date} at {friendly_time} (1 hour)"
+                )
+                await update.message.reply_text(reply, parse_mode="Markdown")
+                save_message("assistant", reply)
+                logger.info(
+                    "Intent add_event from %s — created event '%s' on %s at %s (id=%s)",
+                    user_name, event_summary, date_str, time_str, event_id,
+                )
+
+            except Exception as exc:
+                # Calendar API error, parsing error, etc. — don't expose
+                # the raw exception to the user.
+                logger.error(
+                    "Failed to create calendar event for %s: %s",
+                    user_name, exc, exc_info=True,
+                )
+                reply = (
+                    "⚠️ Sorry, I couldn't create that event — "
+                    "please try again in a moment."
+                )
+                await update.message.reply_text(reply)
+                save_message("assistant", reply)
 
     else:
         # ---- CHAT intent (default fallback) ----
