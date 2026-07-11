@@ -160,16 +160,16 @@ def get_today_events():
 
 def _format_time(iso_string: str) -> str:
     """
-    Convert an ISO-8601 datetime string to a short "HH:MM" time string
+    Convert an ISO-8601 datetime string to a short "H:MM AM/PM" time string
     in the system's local timezone.
 
     Args:
         iso_string: An ISO-8601 datetime string (e.g. "2026-07-10T14:30:00+05:30").
 
     Returns:
-        A formatted time string like "14:30".
+        A formatted time string like "2:30 PM".
     """
     if not iso_string:
         return ""
     dt = datetime.datetime.fromisoformat(iso_string).astimezone()
-    return dt.strftime("%H:%M")
+    return dt.strftime("%I:%M %p").lstrip("0")
