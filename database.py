@@ -72,6 +72,11 @@ def init_db():
             "priority": "ALTER TABLE tasks ADD COLUMN priority TEXT DEFAULT 'medium';",
             "category": "ALTER TABLE tasks ADD COLUMN category TEXT;",
             "completed_at": "ALTER TABLE tasks ADD COLUMN completed_at TIMESTAMP;",
+            # Soft-delete columns: instead of permanently removing a task,
+            # we set deleted = 1 and record when.  The row stays in the DB
+            # for history / potential undo, but is hidden from active views.
+            "deleted": "ALTER TABLE tasks ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;",
+            "deleted_at": "ALTER TABLE tasks ADD COLUMN deleted_at TIMESTAMP;",
         }
 
         for col_name, alter_sql in migrations.items():
@@ -184,8 +189,10 @@ def get_open_tasks():
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        # Exclude both completed AND soft-deleted tasks so the active
+        # list only shows genuinely open, non-deleted items.
         cursor.execute(
-            "SELECT * FROM tasks WHERE done = 0 ORDER BY created_at;"
+            "SELECT * FROM tasks WHERE done = 0 AND deleted = 0 ORDER BY created_at;"
         )
 
         # Convert each sqlite3.Row to a plain dict for easier use elsewhere.
@@ -224,6 +231,83 @@ def mark_task_done(task_id):
         # `rowcount` tells us how many rows the UPDATE affected.
         # If it's 0, no open task with that id exists.
         return cursor.rowcount > 0
+
+
+def delete_task(task_id):
+    """
+    Soft-delete a task by setting deleted = 1 and recording the
+    deletion timestamp.  The task is NOT permanently removed — it
+    stays in the database for history and potential undo, but will
+    no longer appear in get_open_tasks().
+
+    Only tasks that are not already deleted (deleted = 0) will be
+    updated, preventing double-deletes.
+
+    Parameters
+    ----------
+    task_id : int
+        The id of the task to soft-delete.
+
+    Returns
+    -------
+    bool
+        True if the task was found and soft-deleted, False if no
+        task matched the given id or it was already deleted.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+
+        # Only mark as deleted if it isn't already — mirrors the
+        # guard in mark_task_done (AND done = 0).
+        cursor.execute(
+            "UPDATE tasks SET deleted = 1, deleted_at = ? WHERE id = ? AND deleted = 0;",
+            (datetime.now().isoformat(), task_id),
+        )
+        conn.commit()
+
+        # rowcount == 0 means no matching non-deleted task was found.
+        return cursor.rowcount > 0
+
+
+def get_completed_tasks(limit: int = 10) -> list[dict]:
+    """
+    Fetch the most recently completed tasks (done = 1) that have NOT
+    been soft-deleted (deleted = 0).
+
+    This closes the "what did I complete?" honesty gap — instead of the
+    LLM guessing from conversation history, it gets real completion data
+    straight from the database.
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of completed tasks to return (default 10).
+
+    Returns
+    -------
+    list of dict
+        Each dict has all task columns (id, text, due_date, done,
+        created_at, priority, category, completed_at, deleted,
+        deleted_at).  Ordered by completed_at descending (most
+        recently completed first).
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Only return genuinely completed tasks — exclude soft-deleted
+        # ones so "what did I finish?" doesn't surface removed tasks.
+        cursor.execute(
+            "SELECT * FROM tasks WHERE done = 1 AND deleted = 0 "
+            "ORDER BY completed_at DESC LIMIT ?;",
+            (limit,),
+        )
+
+        tasks = [dict(row) for row in cursor.fetchall()]
+
+    return tasks
 
 
 # ---------------------------------------------------------------------------

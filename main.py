@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 # Import our database helpers from database.py
-from database import init_db, add_task, get_open_tasks, mark_task_done, save_message, get_recent_messages
+from database import init_db, add_task, get_open_tasks, mark_task_done, delete_task, get_completed_tasks, save_message, get_recent_messages
 
 # Import the Google Calendar helper for the /agenda command, event creation,
 # and upcoming-week context for chat replies
@@ -270,6 +270,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       4. Branch on the detected intent:
          • add_task       → create the task in the DB, reply with confirmation.
          • complete_task   → validate & mark done, reply with confirmation.
+         • delete_task     → validate & soft-delete, reply with confirmation.
          • add_event       → parse date/time, create a Google Calendar event.
          • chat (default)  → call generate_reply() for a conversational answer.
       5. Save the assistant's reply to the database.
@@ -376,6 +377,58 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Intent complete_task from %s — could not match task_id=%s",
                 user_name, target_id,
             )
+
+    elif intent == "delete_task":
+        # ---- DELETE TASK intent (soft-delete) ----
+        # The user wants to REMOVE a task from the list — NOT complete it.
+        # This is a soft-delete: the task stays in the database (for
+        # history / potential undo) but is hidden from active views.
+        #
+        # We follow the exact same safety pattern as complete_task:
+        # validate the Gemini-returned task_id against our open_tasks
+        # list before doing anything, to guard against hallucinated or
+        # stale ids.
+        target_id = intent_data.get("task_id")
+
+        # Build a set of valid open task ids for fast lookup
+        open_ids = {t["id"] for t in open_tasks}
+
+        if target_id is not None and target_id in open_ids:
+            # ID is valid — soft-delete it
+            delete_task(target_id)
+
+            # Find the task text so we can confirm by name, not just id
+            task_name = next(
+                (t["text"] for t in open_tasks if t["id"] == target_id),
+                f"task #{target_id}",
+            )
+            reply = f"🗑️ Removed *{task_name}* from your task list."
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            save_message("assistant", reply)
+            logger.info(
+                "Intent delete_task from %s — soft-deleted task #%d: %s",
+                user_name, target_id, task_name,
+            )
+        else:
+            # ID is missing, invalid, or not in the open tasks list.
+            # Don't silently delete the wrong task — show the list
+            # so the user can clarify.
+            lines = ["🤔 I wasn't sure which task you meant. Here are your open tasks:\n"]
+            if open_tasks:
+                for t in open_tasks:
+                    due = f"  _(due {t['due_date']})_" if t.get("due_date") else ""
+                    lines.append(f"  • [`{t['id']}`] {t['text']}{due}")
+                lines.append("\nYou can say which one to delete, or tell me more.")
+            else:
+                lines.append("  (You have no open tasks right now.)")
+
+            reply = "\n".join(lines)
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            save_message("assistant", reply)
+            logger.info(
+                "Intent delete_task from %s — could not match task_id=%s",
+                user_name, target_id,
+            )
     elif intent == "add_event":
         # ---- ADD EVENT intent ----
         # Gemini extracted: summary, date (YYYY-MM-DD), start_time (HH:MM).
@@ -461,11 +514,17 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("Could not fetch calendar for chat context: %s", exc)
             today_events = []
 
+        # Fetch recently completed tasks so the LLM can answer "what did
+        # I finish?" using real data instead of guessing from conversation
+        # history.  This closes the "what did I complete?" honesty gap.
+        completed_tasks = get_completed_tasks(limit=10)
+
         reply = generate_reply(
             user_message=user_text,
             open_tasks=open_tasks,
             today_events=today_events,
             recent_messages=recent_messages,
+            completed_tasks=completed_tasks,
         )
 
         await update.message.reply_text(reply)
