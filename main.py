@@ -7,7 +7,9 @@ This is the entry point for the bot. It handles:
   • /tasks    → lists all open (incomplete) tasks
   • /done     → marks a task as completed by its id
   • /agenda   → shows today's Google Calendar events
-  • Any text  → Gemini-powered conversational chat
+  • Any text  → Gemini-powered intent detection first (can add tasks,
+                 complete tasks, or schedule calendar events via natural
+                 language), then falls back to conversational chat.
 
 Uses python-telegram-bot v21.x (async style) with polling.
 """
@@ -83,6 +85,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Task management command handlers
 # ---------------------------------------------------------------------------
 
+# NOTE: This command only sets the task text.  Priority, category, and
+# due_date are intentionally settable only via natural language (the
+# detect_intent() path in chat()), not through this slash command.
 async def addtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle /addtask <task text> — create a new task.
@@ -121,7 +126,8 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     Handle /tasks — list all open (incomplete) tasks.
 
     Calls get_open_tasks() which returns a list of dicts,
-    each with keys: id, text, due_date, done, created_at.
+    each with keys: id, text, due_date, done, created_at,
+    priority, category, completed_at.
     """
 
     open_tasks = get_open_tasks()
@@ -261,9 +267,10 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       2. Gather context: open tasks, today's calendar, recent history.
       3. Call detect_intent() to classify the message as an action or chat.
       4. Branch on the detected intent:
-         • add_task      → create the task in the DB, reply with confirmation.
-         • complete_task  → validate & mark done, reply with confirmation.
-         • chat (default) → call generate_reply() for a conversational answer.
+         • add_task       → create the task in the DB, reply with confirmation.
+         • complete_task   → validate & mark done, reply with confirmation.
+         • add_event       → parse date/time, create a Google Calendar event.
+         • chat (default)  → call generate_reply() for a conversational answer.
       5. Save the assistant's reply to the database.
     """
     user_text = update.message.text

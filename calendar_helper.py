@@ -1,12 +1,15 @@
 """
 calendar_helper.py — Google Calendar integration module.
 
-Provides functions to authenticate with Google Calendar API
-and fetch today's events from the user's primary calendar.
+Provides functions to authenticate with Google Calendar API,
+fetch today's events from the user's primary calendar, and
+create new events.
 
 Usage:
-    from calendar_helper import get_today_events
-    events = get_today_events()
+    from calendar_helper import get_today_events, create_event
+
+    events   = get_today_events()
+    event_id = create_event(summary, start_datetime, end_datetime)
 """
 
 import os
@@ -238,10 +241,14 @@ def _format_time(iso_string: str) -> str:
     Convert an ISO-8601 datetime string to a short "H:MM AM/PM" time string
     in the system's local timezone.
 
-    Args:
-        iso_string: An ISO-8601 datetime string (e.g. "2026-07-10T14:30:00+05:30").
+    Parameters
+    ----------
+    iso_string : str
+        An ISO-8601 datetime string (e.g. "2026-07-10T14:30:00+05:30").
 
-    Returns:
+    Returns
+    -------
+    str
         A formatted time string like "2:30 PM".
     """
     if not iso_string:

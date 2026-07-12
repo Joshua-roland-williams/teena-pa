@@ -1,15 +1,20 @@
 """
-llm_helper.py — Gemini-powered chat module for Teena Bot.
+llm_helper.py — Gemini-powered chat and intent-detection module for Teena Bot.
 
-This module provides a single public function, `generate_reply()`, that sends
-the user's message to Google's Gemini 1.5 Flash model along with contextual
-information (open tasks, today's calendar events, recent conversation history)
-so that the bot can respond in an informed, personal-assistant style.
+This module provides two public functions:
+  • detect_intent()  — classifies a user message into a structured intent
+                        (add_task, complete_task, add_event, or chat) so the
+                        bot can take the right action before falling back to
+                        conversational replies.
+  • generate_reply() — sends the user's message to Gemini along with contextual
+                        information (open tasks, today's calendar events, recent
+                        conversation history) and returns a conversational reply.
 
 Usage:
-    from llm_helper import generate_reply
+    from llm_helper import generate_reply, detect_intent
 
-    reply = generate_reply(
+    intent = detect_intent(user_message, open_tasks)
+    reply  = generate_reply(
         user_message="What's on my plate today?",
         open_tasks=[...],
         today_events=[...],
@@ -42,7 +47,7 @@ if not GEMINI_API_KEY:
 # Configure the SDK with our API key
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Use gemini-1.5-flash — fast, free-tier eligible, great for chat
+# Use gemini-3.1-flash-lite — fast, free-tier eligible, great for chat
 MODEL_NAME = "gemini-3.1-flash-lite"
 
 # Set up a module-level logger
@@ -60,7 +65,8 @@ def _format_tasks_for_prompt(open_tasks: list[dict]) -> str:
     Parameters
     ----------
     open_tasks : list of dict
-        Each dict has keys: id, text, due_date, done, created_at.
+        Each dict has keys: id, text, due_date, done, created_at,
+        priority, category, completed_at.
 
     Returns
     -------
@@ -160,10 +166,9 @@ def _build_chat_history(
     Build the full conversation payload for the Gemini API.
 
     Gemini's `GenerativeModel.generate_content()` accepts a list of
-    content parts.  We start with the system prompt (as the first "user"
-    turn, since Gemini doesn't have a dedicated system role in the basic
-    API), then append the recent conversation history, and finally the
-    user's latest message.
+    content parts.  We inject the system prompt as the first "user" turn
+    (with a model acknowledgement) for simplicity, then append the recent
+    conversation history, and finally the user's latest message.
 
     Parameters
     ----------
@@ -182,8 +187,7 @@ def _build_chat_history(
     history = []
 
     # Inject system prompt as the opening "user" message, with a model ack.
-    # This is the standard pattern for Gemini models that don't have a
-    # separate system-message role in the basic generateContent API.
+    # This project uses the user/model-turn pattern for simplicity.
     history.append({"role": "user", "parts": [system_prompt]})
     history.append({
         "role": "model",
@@ -212,14 +216,16 @@ def detect_intent(user_message: str, open_tasks: list[dict] | None = None) -> di
     Use Gemini to classify the user's message into a structured intent.
 
     The model is asked to determine whether the user wants to:
-      • add_task      — create a new to-do item
-      • complete_task  — mark an existing task as done
-      • chat           — just have a conversation (no task action)
+      • add_task       — create a new to-do item
+      • complete_task   — mark an existing task as done
+      • add_event       — schedule a new Google Calendar event
+      • chat            — just have a conversation (no action needed)
 
     For add_task, the model also extracts task_text, priority, category,
     and due_date from the natural-language message.  For complete_task it
     identifies which open task the user is referring to by matching against
-    the provided open_tasks list.
+    the provided open_tasks list.  For add_event it extracts a summary,
+    date, and start_time.
 
     Parameters
     ----------
@@ -356,7 +362,8 @@ def generate_reply(
         The user's latest chat message.
     open_tasks : list of dict, optional
         Open tasks from database.py's get_open_tasks().
-        Keys: id, text, due_date, done, created_at.
+        Keys: id, text, due_date, done, created_at, priority,
+        category, completed_at.
     today_events : list of dict, optional
         Today's calendar events from calendar_helper.py's get_today_events().
         Keys: summary, start, end.

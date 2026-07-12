@@ -3,7 +3,8 @@ database.py — SQLite database setup for Teena Bot
 
 This module handles all direct database interactions:
   • Creating tables (tasks, mood_logs, messages, facts)
-  • Helper functions for CRUD operations
+  • Helper functions for the operations currently supported
+    (add/read tasks, mark done, save/read messages)
 
 We use Python's built-in `sqlite3` module (no ORM) and context managers
 to make sure connections are always properly closed, even if an error occurs.
@@ -78,7 +79,8 @@ def init_db():
                 cursor.execute(alter_sql)
 
         # --- mood_logs table ---
-        # Tracks the user's mood over time.
+        # Schema-only for now — reserved for the future mood-tracking
+        # phase.  No helper functions read/write this table yet.
         #   • score  – a numeric mood rating (e.g. 1–10)
         #   • note   – optional free-text note about the mood
         cursor.execute("""
@@ -104,7 +106,8 @@ def init_db():
         """)
 
         # --- facts table ---
-        # Stores personal facts/preferences the bot learns about the user.
+        # Schema-only for now — reserved for the future long-term memory
+        # phase.  No helper functions read/write this table yet.
         #   • fact – a single piece of information (e.g. "User likes cats")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS facts (

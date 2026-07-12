@@ -1,6 +1,6 @@
 # Teena
 
-Teena is a personal Telegram assistant bot built for personal use. It is designed to help manage tasks, track mood, sync with Google Calendar, and chat using an LLM (Gemini) for advice and daily planning. This is built as a learning project and is currently in active development.
+Teena is a personal Telegram assistant bot built for personal use. It is designed to help manage tasks, sync with Google Calendar, and chat using an LLM (Gemini) for advice and daily planning. This is built as a learning project and is currently in active development.
 
 ## Features
 
@@ -9,20 +9,25 @@ Teena is a personal Telegram assistant bot built for personal use. It is designe
   * `/addtask <task text>` - Add a new task to your list.
   * `/tasks` - Display all open/incomplete tasks.
   * `/done <id>` - Mark a task as completed.
-* **SQLite-based Storage**: Locally saves all task information.
+* **Google Calendar Integration**:
+  * `/agenda` - View today's Google Calendar events.
+  * Schedule new calendar events via natural language (e.g. "Schedule a team meeting tomorrow at 3pm").
+* **LLM Chat (Gemini)**:
+  * Conversational AI that understands your tasks and calendar context.
+  * Natural-language actions — add tasks, complete tasks, and create events just by chatting (no slash commands needed).
+* **SQLite-based Storage**: Locally saves tasks, conversation history, and metadata.
 
 ### Planned / In Progress
-* **Google Calendar Sync**: Syncing tasks and events directly to a calendar.
 * **Mood Tracking**: Log and visualize daily mood entries.
-* **LLM Chat**: Conversational AI utilizing Google Gemini for scheduling, planning, and general advice.
+* **Long-Term Memory**: Persistent personal facts/preferences the bot learns over time.
 * **Proactive Scheduled Check-ins**: Automated messages asking for daily check-ins or reminding about due tasks.
 
 ## Tech Stack
 * **Python 3.12**
 * **python-telegram-bot v21.x** (async style)
 * **SQLite** (standard library database)
-* **Google Calendar API** (planned)
-* **Google Gemini API** (planned)
+* **Google Calendar API** (OAuth 2.0, read/write)
+* **Google Gemini API** (gemini-3.1-flash-lite for chat and intent detection)
 * **APScheduler** (planned for check-ins)
 
 ## Setup Instructions
@@ -56,30 +61,44 @@ Follow these steps to set up and run the bot locally:
    ```
 
 5. **Configure environment variables**:
-   Create a file named `.env` in the root of the project and add your Telegram bot token:
+   Create a file named `.env` in the root of the project and add:
    ```env
    TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+   GEMINI_API_KEY=your_gemini_api_key_here
    ```
-   *(Note: You can get a bot token from [@BotFather](https://t.me/BotFather) on Telegram).*
+   * You can get a Telegram bot token from [@BotFather](https://t.me/BotFather).
+   * You can get a Gemini API key from [Google AI Studio](https://aistudio.google.com/).
 
-6. **Run the bot**:
+6. **Set up Google Calendar credentials**:
+   * Go to the [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials.
+   * Create an OAuth 2.0 Client ID (Desktop application type).
+   * Download the JSON file and save it as `credentials.json` in the project root.
+   * On first run, the bot will open a browser window for you to authorize calendar access. The resulting token is saved to `token.json` for future runs.
+
+7. **Run the bot**:
    ```bash
    python main.py
    ```
 
 ## Project Structure
 
-* **[main.py](file:///c:/Users/LENOVO/Desktop/TBOT/main.py)**: Contains the Telegram bot logic, command handlers (e.g., `/start`, `/addtask`, `/tasks`, `/done`), and the polling loop.
-* **[database.py](file:///c:/Users/LENOVO/Desktop/TBOT/database.py)**: Handles direct SQLite database connections, table creation (`tasks`, `mood_logs`, etc.), and helper functions for CRUD operations.
+* **[main.py](main.py)**: Entry point — Telegram command handlers (`/start`, `/addtask`, `/tasks`, `/done`, `/agenda`), the natural-language chat handler with intent routing, and the polling loop.
+* **[database.py](database.py)**: SQLite database setup, table creation (tasks, messages, mood_logs, facts), and helper functions for task and message operations.
+* **[llm_helper.py](llm_helper.py)**: Gemini-powered intent detection (`detect_intent()`) and conversational reply generation (`generate_reply()`), including prompt building with task/calendar/history context.
+* **[calendar_helper.py](calendar_helper.py)**: Google Calendar API integration — OAuth authentication, fetching today's events (`get_today_events()`), and creating new events (`create_event()`).
 
 ## Status / Roadmap
 
 This is a personal work-in-progress project built incrementally across multiple phases:
 
-* **Phase 1 (Done)**: Skeleton bot implementation with basic message echo and polling setup.
-* **Phase 2 (Done)**: SQLite task management with interactive commands.
-* **Phase 3 (Next)**: Google Calendar integration to sync tasks.
+* **Phase 1 (Done)**: Skeleton bot with basic message echo and polling setup.
+* **Phase 2 (Done)**: SQLite task management with `/addtask`, `/tasks`, `/done`.
+* **Phase 3 (Done)**: Google Calendar integration — `/agenda` to view today's events.
+* **Phase 4a (Done)**: Gemini LLM chat — context-aware conversational replies.
+* **Phase 4b (Done)**: Natural-language intent detection — add tasks and complete tasks via free text.
+* **Phase 4c (Done)**: Natural-language event creation — schedule calendar events via free text.
+* **Phase 4d (Next)**: Reschedule/delete support for tasks and events; conversation-aware intent detection.
 * **Future Phases**:
   * Mood tracking feature
-  * LLM chat integration with Google Gemini
+  * Long-term memory (facts/preferences)
   * Proactive/scheduled check-ins using APScheduler
