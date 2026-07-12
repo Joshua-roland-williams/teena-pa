@@ -2,14 +2,15 @@
 calendar_helper.py — Google Calendar integration module.
 
 Provides functions to authenticate with Google Calendar API,
-fetch today's events from the user's primary calendar, and
-create new events.
+fetch today's events from the user's primary calendar,
+create new events, and update existing events.
 
 Usage:
-    from calendar_helper import get_today_events, create_event
+    from calendar_helper import get_today_events, create_event, update_event
 
     events   = get_today_events()
     event_id = create_event(summary, start_datetime, end_datetime)
+    update_event(event_id, summary="New title")
 """
 
 import os
@@ -229,7 +230,10 @@ def get_upcoming_events(days_ahead: int = 7) -> list[dict]:
         # Human-friendly date label, e.g. "Mon, Jul 13"
         date_label = event_date.strftime("%a, %b %d")
 
+        # Include the Google Calendar event id so the event can be
+        # referenced later (e.g. for updates or deletion).
         parsed.append({
+            "id": event.get("id"),
             "summary": summary,
             "start": start_str,
             "end": end_str,
@@ -308,6 +312,102 @@ def create_event(
     except Exception as exc:
         raise RuntimeError(
             f"Failed to create calendar event '{summary}': {exc}"
+        ) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Event Updating
+# --------------------------------------------------------------------------- #
+
+def update_event(
+    event_id: str,
+    summary: str | None = None,
+    start_datetime: datetime.datetime | None = None,
+    end_datetime: datetime.datetime | None = None,
+) -> str:
+    """
+    Update an existing event on the user's primary Google Calendar.
+
+    Only the fields that are explicitly provided (non-None) are changed;
+    everything else is left as-is.
+
+    Parameters
+    ----------
+    event_id : str
+        The Google Calendar event ID to update.
+    summary : str or None
+        New event title.  Pass None to leave unchanged.
+    start_datetime : datetime.datetime or None
+        New timezone-aware start time.
+    end_datetime : datetime.datetime or None
+        New timezone-aware end time.
+        **Both** start_datetime and end_datetime must be provided together
+        (or both left as None) to keep the event valid.
+
+    Returns
+    -------
+    str
+        The Google Calendar event ID of the updated event.
+
+    Raises
+    ------
+    ValueError
+        If only one of start_datetime / end_datetime is given, or if the
+        supplied datetimes are not timezone-aware.
+    RuntimeError
+        If the Google Calendar API call fails for any reason.
+    """
+    # ── Validate time arguments ──────────────────────────────────────────
+    # Both times must be supplied together so the event stays consistent.
+    if (start_datetime is None) != (end_datetime is None):
+        raise ValueError(
+            "start_datetime and end_datetime must be updated together. "
+            "Provide both or neither."
+        )
+
+    # If times are provided, they must carry timezone info for the API.
+    if start_datetime is not None and end_datetime is not None:
+        if start_datetime.tzinfo is None or end_datetime.tzinfo is None:
+            raise ValueError(
+                "start_datetime and end_datetime must be timezone-aware "
+                "(have tzinfo set).  Use .astimezone() or pass tz= to the "
+                "datetime constructor."
+            )
+
+    try:
+        service = get_calendar_service()
+
+        # ── Fetch the existing event so we only patch what changed ────────
+        existing_event = (
+            service.events()
+            .get(calendarId="primary", eventId=event_id)
+            .execute()
+        )
+
+        # ── Apply requested changes ──────────────────────────────────────
+        if summary is not None:
+            existing_event["summary"] = summary
+
+        if start_datetime is not None and end_datetime is not None:
+            existing_event["start"] = {"dateTime": start_datetime.isoformat()}
+            existing_event["end"]   = {"dateTime": end_datetime.isoformat()}
+
+        # ── Save the updated event back to Google Calendar ───────────────
+        updated_event = (
+            service.events()
+            .update(
+                calendarId="primary",
+                eventId=event_id,
+                body=existing_event,
+            )
+            .execute()
+        )
+
+        return updated_event["id"]
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to update calendar event '{event_id}': {exc}"
         ) from exc
 
 
