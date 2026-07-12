@@ -160,6 +160,85 @@ def get_today_events():
     return parsed
 
 
+def get_upcoming_events(days_ahead: int = 7) -> list[dict]:
+    """
+    Fetch events from now until `days_ahead` days in the future.
+
+    Unlike get_today_events() (which is scoped to a single day for the
+    /agenda quick-view), this function gives the LLM a broader planning
+    horizon so it can answer questions like "what does my week look like?"
+
+    Each returned dict includes a ``date`` key (e.g. "Mon, Jul 13") so
+    events from different days can be distinguished when displayed together.
+
+    Parameters
+    ----------
+    days_ahead : int
+        Number of days into the future to fetch (default 7, i.e. one week).
+
+    Returns
+    -------
+    list of dict
+        Each dict has keys: summary, start, end, date.
+        Results are ordered by start time across all days.
+        Returns an empty list when there are no upcoming events.
+    """
+    service = get_calendar_service()
+
+    now = datetime.datetime.now().astimezone()           # current local time
+    local_tz = now.tzinfo
+
+    # End boundary: midnight at the end of the last day in the window
+    end_date = now.date() + datetime.timedelta(days=days_ahead)
+    end_boundary = datetime.datetime.combine(
+        end_date, datetime.time.max, tzinfo=local_tz
+    )
+
+    # Query the Calendar API — from *now* (not midnight) through the window
+    events_result = service.events().list(
+        calendarId="primary",
+        timeMin=now.isoformat(),
+        timeMax=end_boundary.isoformat(),
+        singleEvents=True,              # expand recurring events
+        orderBy="startTime",
+    ).execute()
+
+    raw_events = events_result.get("items", [])
+
+    parsed = []
+    for event in raw_events:
+        summary = event.get("summary", "(No title)")
+
+        start_info = event.get("start", {})
+        end_info = event.get("end", {})
+
+        # All-day events use "date"; timed events use "dateTime"
+        if "date" in start_info:
+            start_str = "All day"
+            end_str = "All day"
+            # All-day events store the date as a plain "YYYY-MM-DD" string
+            event_date = datetime.date.fromisoformat(start_info["date"])
+        else:
+            start_str = _format_time(start_info.get("dateTime", ""))
+            end_str = _format_time(end_info.get("dateTime", ""))
+            # Extract the date portion from the ISO datetime
+            event_date = datetime.datetime.fromisoformat(
+                start_info["dateTime"]
+            ).astimezone().date()
+
+        # Human-friendly date label, e.g. "Mon, Jul 13"
+        date_label = event_date.strftime("%a, %b %d")
+
+        parsed.append({
+            "summary": summary,
+            "start": start_str,
+            "end": end_str,
+            "date": date_label,
+        })
+
+    return parsed
+
+
 # --------------------------------------------------------------------------- #
 # Event Creation
 # --------------------------------------------------------------------------- #

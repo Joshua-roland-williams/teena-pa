@@ -31,8 +31,9 @@ from telegram.ext import (
 # Import our database helpers from database.py
 from database import init_db, add_task, get_open_tasks, mark_task_done, save_message, get_recent_messages
 
-# Import the Google Calendar helper for the /agenda command and event creation
-from calendar_helper import get_today_events, create_event
+# Import the Google Calendar helper for the /agenda command, event creation,
+# and upcoming-week context for chat replies
+from calendar_helper import get_today_events, get_upcoming_events, create_event
 
 # Import the Gemini LLM helper for conversational chat and intent detection
 from llm_helper import generate_reply, detect_intent
@@ -450,11 +451,12 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # No actionable intent detected — use the full conversational
         # reply pipeline with task, calendar, and history context.
 
-        # Fetch calendar events only for chat replies — add_task and
-        # complete_task branches don't need them, so we skip the network
-        # call in those cases for faster responses.
+        # Fetch the upcoming week of calendar events so the LLM can
+        # answer planning questions beyond just today.  We use
+        # get_upcoming_events() here instead of get_today_events() —
+        # /agenda still uses the today-only version for its quick view.
         try:
-            today_events = get_today_events()
+            today_events = get_upcoming_events(days_ahead=7)
         except Exception as exc:
             logger.warning("Could not fetch calendar for chat context: %s", exc)
             today_events = []
