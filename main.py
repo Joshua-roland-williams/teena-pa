@@ -8,8 +8,9 @@ This is the entry point for the bot. It handles:
   • /done     → marks a task as completed by its id
   • /agenda   → shows today's Google Calendar events
   • Any text  → Gemini-powered intent detection first (can add tasks,
-                 complete tasks, or schedule calendar events via natural
-                 language), then falls back to conversational chat.
+                 complete tasks, schedule calendar events, or reschedule
+                 existing events via natural language), then falls back
+                 to conversational chat.
 
 Uses python-telegram-bot v21.x (async style) with polling.
 """
@@ -32,8 +33,8 @@ from telegram.ext import (
 from database import init_db, add_task, get_open_tasks, mark_task_done, delete_task, get_completed_tasks, save_message, get_recent_messages
 
 # Import the Google Calendar helper for the /agenda command, event creation,
-# and upcoming-week context for chat replies
-from calendar_helper import get_today_events, get_upcoming_events, create_event
+# event rescheduling, and upcoming-week context for chat replies
+from calendar_helper import get_today_events, get_upcoming_events, create_event, update_event
 
 # Import the Gemini LLM helper for conversational chat and intent detection
 from llm_helper import generate_reply, detect_intent
@@ -268,11 +269,12 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
       2. Gather context: open tasks, today's calendar, recent history.
       3. Call detect_intent() to classify the message as an action or chat.
       4. Branch on the detected intent:
-         • add_task       → create the task in the DB, reply with confirmation.
-         • complete_task   → validate & mark done, reply with confirmation.
-         • delete_task     → validate & soft-delete, reply with confirmation.
-         • add_event       → parse date/time, create a Google Calendar event.
-         • chat (default)  → call generate_reply() for a conversational answer.
+         • add_task          → create the task in the DB, reply with confirmation.
+         • complete_task      → validate & mark done, reply with confirmation.
+         • delete_task        → validate & soft-delete, reply with confirmation.
+         • add_event          → parse date/time, create a Google Calendar event.
+         • reschedule_event   → validate event id, update via Calendar API.
+         • chat (default)     → call generate_reply() for a conversational answer.
       5. Save the assistant's reply to the database.
     """
     user_text = update.message.text
@@ -285,10 +287,21 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     open_tasks = get_open_tasks()
     recent_messages = get_recent_messages(limit=10)
 
+    # Fetch upcoming events ONCE and reuse for both intent detection and
+    # the chat fallback — avoids a redundant second Calendar API call.
+    try:
+        upcoming_events = get_upcoming_events(days_ahead=7)
+    except Exception as exc:
+        logger.warning("Could not fetch upcoming events for intent context: %s", exc)
+        upcoming_events = []
+
     # Step 3 — Detect the user's intent before falling back to normal chat.
     # detect_intent() always returns a dict with at least {"intent": "chat"}
     # so it's safe to branch on without extra null checks.
-    intent_data = detect_intent(user_text, open_tasks)
+    # We pass recent_messages so the model can combine multi-turn requests
+    # (e.g. user says "schedule a meeting", Teena asks "what time?", user
+    # replies "3pm" → the model stitches these into one add_event intent).
+    intent_data = detect_intent(user_text, open_tasks, upcoming_events, recent_messages)
     intent = intent_data.get("intent", "chat")
 
     # ------------------------------------------------------------------
@@ -445,7 +458,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply = generate_reply(
                 user_message=user_text,
                 open_tasks=open_tasks,
-                today_events=[],
+                today_events=upcoming_events,
                 recent_messages=recent_messages,
             )
             await update.message.reply_text(reply)
@@ -499,20 +512,177 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(reply)
                 save_message("assistant", reply)
 
+    elif intent == "reschedule_event":
+        # ---- RESCHEDULE EVENT intent ----
+        # Gemini matched the user's message to an existing calendar event
+        # and returned the event_id plus any new_summary / new_date /
+        # new_start_time fields.
+        #
+        # VALIDATE-BEFORE-ACTING pattern (same principle as tasks):
+        # The LLM might hallucinate an event_id that doesn't actually
+        # exist in the upcoming_events list we fetched.  We check it
+        # against the real list before calling the Calendar API.
+        target_event_id = intent_data.get("event_id")
+
+        # Build a lookup of valid event ids from the list we fetched earlier
+        valid_event_ids = {e["id"] for e in upcoming_events if e.get("id")}
+
+        if target_event_id and target_event_id in valid_event_ids:
+            # --- ID is valid — build the update parameters ---
+            new_summary = intent_data.get("new_summary")  # str or None
+            new_date_str = intent_data.get("new_date")      # "YYYY-MM-DD" or None
+            new_time_str = intent_data.get("new_start_time")  # "HH:MM" or None
+
+            # Find the original event dict so we can preserve its duration
+            original_event = next(
+                (e for e in upcoming_events if e["id"] == target_event_id), None
+            )
+
+            try:
+                new_start_dt = None
+                new_end_dt = None
+
+                # If the user provided a new date and/or time, build
+                # timezone-aware datetimes.  We preserve the original
+                # event's duration when only the start changes.
+                if new_date_str or new_time_str:
+                    local_tz = datetime.datetime.now().astimezone().tzinfo
+
+                    # Determine the original event's start/end so we can
+                    # compute its duration and use defaults for missing fields.
+                    orig_start_str = original_event.get("start", "") if original_event else ""
+                    orig_end_str = original_event.get("end", "") if original_event else ""
+                    orig_date_label = original_event.get("date", "") if original_event else ""
+
+                    # Try to parse the original start/end times ("H:MM AM/PM")
+                    # to compute the original duration. Default to 1 hour.
+                    original_duration = datetime.timedelta(hours=1)
+                    try:
+                        if orig_start_str and orig_end_str and orig_start_str != "All day":
+                            orig_start_time = datetime.datetime.strptime(
+                                orig_start_str, "%I:%M %p"
+                            ).time()
+                            orig_end_time = datetime.datetime.strptime(
+                                orig_end_str, "%I:%M %p"
+                            ).time()
+                            # Combine with a dummy date to compute delta
+                            dummy_date = datetime.date.today()
+                            orig_s = datetime.datetime.combine(dummy_date, orig_start_time)
+                            orig_e = datetime.datetime.combine(dummy_date, orig_end_time)
+                            if orig_e > orig_s:
+                                original_duration = orig_e - orig_s
+                    except (ValueError, TypeError):
+                        pass  # Fall back to 1-hour default
+
+                    # Resolve the new start date — use new_date_str if
+                    # provided, otherwise keep today's date as a fallback.
+                    if new_date_str:
+                        start_date = datetime.date.fromisoformat(new_date_str)
+                    else:
+                        # No new date — keep the original event's date.
+                        # orig_date_label is like "Mon, Jul 13" — parse it
+                        # relative to the current year.
+                        try:
+                            parsed = datetime.datetime.strptime(
+                                f"{orig_date_label} {datetime.date.today().year}",
+                                "%a, %b %d %Y",
+                            )
+                            start_date = parsed.date()
+                        except (ValueError, TypeError):
+                            start_date = datetime.date.today()
+
+                    # Resolve the new start time — use new_time_str if
+                    # provided, otherwise keep the original event's time.
+                    if new_time_str:
+                        start_time = datetime.datetime.strptime(
+                            new_time_str, "%H:%M"
+                        ).time()
+                    else:
+                        # No new time — keep the original event's start time
+                        try:
+                            start_time = datetime.datetime.strptime(
+                                orig_start_str, "%I:%M %p"
+                            ).time()
+                        except (ValueError, TypeError):
+                            start_time = datetime.time(9, 0)  # safe fallback
+
+                    naive_start = datetime.datetime.combine(start_date, start_time)
+                    new_start_dt = naive_start.replace(tzinfo=local_tz)
+
+                    # Preserve the original duration
+                    new_end_dt = new_start_dt + original_duration
+
+                # Call the Calendar API to apply the update
+                updated_id = update_event(
+                    event_id=target_event_id,
+                    summary=new_summary,
+                    start_datetime=new_start_dt,
+                    end_datetime=new_end_dt,
+                )
+
+                # Build a human-friendly confirmation message
+                confirm_parts = []
+                if new_summary:
+                    confirm_parts.append(f"title → *{new_summary}*")
+                if new_start_dt:
+                    friendly_time = new_start_dt.strftime("%I:%M %p").lstrip("0")
+                    friendly_date = new_start_dt.strftime("%A, %B %d")
+                    confirm_parts.append(f"time → {friendly_date} at {friendly_time}")
+
+                event_name = new_summary or (
+                    original_event.get("summary", "event") if original_event else "event"
+                )
+                changes_str = ", ".join(confirm_parts) if confirm_parts else "updated"
+                reply = f"✏️ Rescheduled *{event_name}*: {changes_str}"
+                await update.message.reply_text(reply, parse_mode="Markdown")
+                save_message("assistant", reply)
+                logger.info(
+                    "Intent reschedule_event from %s — updated event '%s' (id=%s)",
+                    user_name, event_name, updated_id,
+                )
+
+            except Exception as exc:
+                # Calendar API error, date parsing error, etc.
+                logger.error(
+                    "Failed to reschedule event for %s: %s",
+                    user_name, exc, exc_info=True,
+                )
+                reply = (
+                    "⚠️ Sorry, I couldn't reschedule that event — "
+                    "please try again in a moment."
+                )
+                await update.message.reply_text(reply)
+                save_message("assistant", reply)
+        else:
+            # Event ID is missing, invalid, or not in the upcoming events list.
+            # Don't guess — show the list so the user can clarify.
+            lines = ["🤔 I wasn't sure which event you meant. Here are your upcoming events:\n"]
+            if upcoming_events:
+                for e in upcoming_events:
+                    date_label = e.get("date", "")
+                    if e["start"] == "All day":
+                        lines.append(f"  • {date_label}: {e['summary']} _(all day)_")
+                    else:
+                        lines.append(f"  • {date_label}: {e['start']} – {e['end']}  {e['summary']}")
+                lines.append("\nCan you tell me which one to reschedule?")
+            else:
+                lines.append("  (No upcoming events found.)")
+
+            reply = "\n".join(lines)
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            save_message("assistant", reply)
+            logger.info(
+                "Intent reschedule_event from %s — could not match event_id=%s",
+                user_name, target_event_id,
+            )
+
     else:
         # ---- CHAT intent (default fallback) ----
         # No actionable intent detected — use the full conversational
         # reply pipeline with task, calendar, and history context.
-
-        # Fetch the upcoming week of calendar events so the LLM can
-        # answer planning questions beyond just today.  We use
-        # get_upcoming_events() here instead of get_today_events() —
-        # /agenda still uses the today-only version for its quick view.
-        try:
-            today_events = get_upcoming_events(days_ahead=7)
-        except Exception as exc:
-            logger.warning("Could not fetch calendar for chat context: %s", exc)
-            today_events = []
+        #
+        # Reuse the upcoming_events we already fetched at the top of
+        # chat() — no need to call get_upcoming_events() again.
 
         # Fetch recently completed tasks so the LLM can answer "what did
         # I finish?" using real data instead of guessing from conversation
@@ -522,7 +692,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply = generate_reply(
             user_message=user_text,
             open_tasks=open_tasks,
-            today_events=today_events,
+            today_events=upcoming_events,
             recent_messages=recent_messages,
             completed_tasks=completed_tasks,
         )
