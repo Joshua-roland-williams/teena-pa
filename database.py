@@ -3,8 +3,10 @@ database.py — SQLite database setup for Teena Bot
 
 This module handles all direct database interactions:
   • Creating tables (tasks, mood_logs, messages, facts)
-  • Helper functions for the operations currently supported
-    (add/read tasks, mark done, save/read messages)
+  • Helper functions for the operations currently supported:
+    - Tasks: add/read tasks, mark done, delete, view completed
+    - Mood logging: log mood, retrieve recent entries, compute averages
+    - Messages: save/read conversation messages
 
 We use Python's built-in `sqlite3` module (no ORM) and context managers
 to make sure connections are always properly closed, even if an error occurs.
@@ -84,8 +86,8 @@ def init_db():
                 cursor.execute(alter_sql)
 
         # --- mood_logs table ---
-        # Schema-only for now — reserved for the future mood-tracking
-        # phase.  No helper functions read/write this table yet.
+        # Stores mood entries for the user's mood-tracking feature.
+        # See log_mood(), get_recent_moods(), get_mood_average().
         #   • score  – a numeric mood rating (e.g. 1–10)
         #   • note   – optional free-text note about the mood
         cursor.execute("""
@@ -308,6 +310,122 @@ def get_completed_tasks(limit: int = 10) -> list[dict]:
         tasks = [dict(row) for row in cursor.fetchall()]
 
     return tasks
+
+
+# ---------------------------------------------------------------------------
+# Mood logging helper functions
+# ---------------------------------------------------------------------------
+
+def log_mood(score: int, note: str | None = None) -> int:
+    """
+    Insert a new mood entry and return its id.
+
+    Parameters
+    ----------
+    score : int
+        A mood rating from 1 (worst) to 10 (best).
+    note : str or None
+        Optional free-text note describing the mood.
+
+    Returns
+    -------
+    int
+        The auto-generated id of the newly created mood entry.
+
+    Raises
+    ------
+    ValueError
+        If score is not an integer in the 1–10 range.
+    """
+
+    # Validate score before touching the database.
+    if not isinstance(score, int) or not 1 <= score <= 10:
+        raise ValueError(f"score must be an integer between 1 and 10, got {score!r}")
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO mood_logs (score, note) VALUES (?, ?);",
+            (score, note),
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+
+    return new_id
+
+
+def get_recent_moods(limit: int = 7) -> list[dict]:
+    """
+    Fetch the most recent mood entries, newest-first.
+
+    The default limit of 7 gives roughly a week's worth of entries
+    (assuming one entry per day).
+
+    Parameters
+    ----------
+    limit : int
+        Maximum number of mood entries to return (default 7).
+
+    Returns
+    -------
+    list of dict
+        Each dict has keys: id, score, note, created_at.
+        Ordered by created_at descending (newest first).
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, score, note, created_at FROM mood_logs "
+            "ORDER BY created_at DESC LIMIT ?;",
+            (limit,),
+        )
+
+        moods = [dict(row) for row in cursor.fetchall()]
+
+    return moods
+
+
+def get_mood_average(days: int = 7) -> float | None:
+    """
+    Compute the average mood score over the last N days.
+
+    Uses created_at to determine which entries fall within the window.
+    Returns None when there are no entries in that period so callers
+    can distinguish "no data" from "average of 0".
+
+    Parameters
+    ----------
+    days : int
+        Number of days to look back (default 7).
+
+    Returns
+    -------
+    float or None
+        The average score rounded to 1 decimal place, or None if
+        there are no mood entries in the specified window.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+
+        # SQLite's datetime('now', '-N days') gives us the cutoff point.
+        # We use a parameterised modifier string for safety.
+        cursor.execute(
+            "SELECT AVG(score) FROM mood_logs "
+            "WHERE created_at >= datetime('now', ?);",
+            (f"-{days} days",),
+        )
+
+        result = cursor.fetchone()[0]
+
+    # AVG() returns NULL (→ Python None) when there are no matching rows.
+    if result is None:
+        return None
+
+    return round(result, 1)
 
 
 # ---------------------------------------------------------------------------

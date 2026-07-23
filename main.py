@@ -7,10 +7,11 @@ This is the entry point for the bot. It handles:
   • /tasks    → lists all open (incomplete) tasks
   • /done     → marks a task as completed by its id
   • /agenda   → shows today's Google Calendar events
+  • /mood     → logs a mood score (1-10) with an optional note
   • Any text  → Gemini-powered intent detection first (can add tasks,
-                 complete tasks, schedule calendar events, or reschedule
-                 existing events via natural language), then falls back
-                 to conversational chat.
+                 complete tasks, schedule calendar events, reschedule
+                 existing events, or log moods via natural language),
+                 then falls back to conversational chat.
 
 Uses python-telegram-bot v21.x (async style) with polling.
 """
@@ -30,7 +31,7 @@ from telegram.ext import (
 )
 
 # Import our database helpers from database.py
-from database import init_db, add_task, get_open_tasks, mark_task_done, delete_task, get_completed_tasks, save_message, get_recent_messages
+from database import init_db, add_task, get_open_tasks, mark_task_done, delete_task, get_completed_tasks, save_message, get_recent_messages, log_mood, get_recent_moods, get_mood_average
 
 # Import the Google Calendar helper for the /agenda command, event creation,
 # event rescheduling, and upcoming-week context for chat replies
@@ -75,7 +76,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/addtask <text>` — add a task\n"
         "• `/tasks` — see your open tasks\n"
         "• `/done <id>` — mark a task complete\n"
-        "• `/agenda` — see today's calendar events\n\n"
+        "• `/agenda` — see today's calendar events\n"
+        "• `/mood <1-10> [note]` — log how you're feeling\n\n"
         "Or just send me a message — I can add tasks, schedule "
         "events, and chat! 💬"
     )
@@ -256,6 +258,73 @@ async def agenda_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
+# Mood tracking command handler
+# ---------------------------------------------------------------------------
+
+async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /mood <score 1-10> [optional note] — log a mood entry.
+
+    The first argument must be an integer 1-10.  Everything after it is
+    treated as an optional free-text note.
+    """
+
+    # If the user just types "/mood" with nothing after it, show usage.
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/mood <score 1-10> [note]`\n"
+            "Example: `/mood 7 feeling pretty good today`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Parse the score — must be an integer 1-10
+    try:
+        score = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            f"`{context.args[0]}` isn't a valid score.\n"
+            "Please use a number from 1 to 10, e.g. `/mood 7`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not 1 <= score <= 10:
+        await update.message.reply_text(
+            "Score should be between 1 and 10.\n"
+            "Example: `/mood 7 feeling pretty good today`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Everything after the score is the optional note
+    note = " ".join(context.args[1:]) if len(context.args) > 1 else None
+
+    # Persist the mood entry
+    log_mood(score, note)
+
+    # Reply with a brief, warm acknowledgment — vary tone based on score
+    if score <= 3:
+        # Low score: gentle, no advice, just acknowledgment
+        reply = "Noted 💙 Thanks for sharing — hope the rest of the day is kinder to you."
+    elif score <= 5:
+        # Mid-low: simple acknowledgment
+        reply = "Got it — logged. Hang in there 🤍"
+    elif score <= 7:
+        # Decent: brief positive
+        reply = "Logged! Sounds like a solid day 👍"
+    else:
+        # High score: short celebratory
+        reply = "Love that — logged! 🌟"
+
+    await update.message.reply_text(reply)
+    logger.info(
+        "User %s logged mood: score=%d note=%s",
+        update.effective_user.first_name, score, note,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Chat handler — Gemini-powered conversational replies
 # ---------------------------------------------------------------------------
 
@@ -274,6 +343,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          • delete_task        → validate & soft-delete, reply with confirmation.
          • add_event          → parse date/time, create a Google Calendar event.
          • reschedule_event   → validate event id, update via Calendar API.
+         • log_mood           → log mood score + note, reply naturally.
          • chat (default)     → call generate_reply() for a conversational answer.
       5. Save the assistant's reply to the database.
     """
@@ -676,10 +746,59 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 user_name, target_event_id,
             )
 
+    elif intent == "log_mood":
+        # ---- LOG MOOD intent (natural-language mood detection) ----
+        # CONSERVATIVE CLASSIFICATION: This branch only fires when the
+        # user genuinely shared how they're feeling (e.g. "feeling pretty
+        # drained today").  detect_intent() is instructed to be conservative
+        # — when in doubt it falls back to chat, so we don't put words in
+        # the user's mouth or log a mood they didn't actually express.
+        score = intent_data.get("score")
+        note = intent_data.get("note")
+
+        # Validate the score — if Gemini returned something unexpected,
+        # just fall through to chat rather than crashing or logging junk.
+        if isinstance(score, int) and 1 <= score <= 10:
+            log_mood(score, note)
+
+            # Brief, natural acknowledgment — not clinical, not therapy-speak.
+            # Vary tone slightly based on the score range.
+            if score <= 3:
+                reply = "Heard you 💙 Thanks for sharing that."
+            elif score <= 5:
+                reply = "Noted — thanks for telling me 🤍"
+            elif score <= 7:
+                reply = "Gotcha 👍 Thanks for checking in."
+            else:
+                reply = "That's great to hear 🌟"
+
+            await update.message.reply_text(reply)
+            save_message("assistant", reply)
+            logger.info(
+                "Intent log_mood from %s — score=%d note=%s",
+                user_name, score, note,
+            )
+        else:
+            # Invalid score from the model — treat as a normal chat message
+            logger.warning(
+                "Intent log_mood from %s had invalid score=%s, falling back to chat",
+                user_name, score,
+            )
+            completed_tasks = get_completed_tasks(limit=10)
+            reply = generate_reply(
+                user_message=user_text,
+                open_tasks=open_tasks,
+                today_events=upcoming_events,
+                recent_messages=recent_messages,
+                completed_tasks=completed_tasks,
+            )
+            await update.message.reply_text(reply)
+            save_message("assistant", reply)
+
     else:
         # ---- CHAT intent (default fallback) ----
         # No actionable intent detected — use the full conversational
-        # reply pipeline with task, calendar, and history context.
+        # reply pipeline with task, calendar, history, and mood context.
         #
         # Reuse the upcoming_events we already fetched at the top of
         # chat() — no need to call get_upcoming_events() again.
@@ -689,12 +808,19 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # history.  This closes the "what did I complete?" honesty gap.
         completed_tasks = get_completed_tasks(limit=10)
 
+        # Fetch recent mood entries so Teena can be aware of how the user
+        # is doing.  This feeds into the system prompt's RECENT MOOD
+        # section — Teena will reference it sparingly and only when
+        # genuinely relevant (see mood guidelines in _build_system_prompt).
+        recent_moods = get_recent_moods(limit=7)
+
         reply = generate_reply(
             user_message=user_text,
             open_tasks=open_tasks,
             today_events=upcoming_events,
             recent_messages=recent_messages,
             completed_tasks=completed_tasks,
+            recent_moods=recent_moods,
         )
 
         await update.message.reply_text(reply)
@@ -724,6 +850,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tasks", tasks_command))
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("agenda", agenda_command))  # Calendar agenda
+    app.add_handler(CommandHandler("mood", mood_command))       # Mood tracking
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))  # Gemini chat
 
     # Start polling — the bot will keep running until you press Ctrl+C
