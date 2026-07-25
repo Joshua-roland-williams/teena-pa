@@ -77,7 +77,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/tasks` — see your open tasks\n"
         "• `/done <id>` — mark a task complete\n"
         "• `/agenda` — see today's calendar events\n"
-        "• `/mood <1-10> [note]` — log how you're feeling\n\n"
+        "• `/mood <1-10> [note]` — log how you're feeling\n"
+        "• `/moodstats` — see your mood summary & trends\n\n"
         "Or just send me a message — I can add tasks, schedule "
         "events, and chat! 💬"
     )
@@ -322,6 +323,61 @@ async def mood_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "User %s logged mood: score=%d note=%s",
         update.effective_user.first_name, score, note,
     )
+
+
+# ---------------------------------------------------------------------------
+# Mood stats command handler
+# ---------------------------------------------------------------------------
+
+async def moodstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /moodstats — show mood averages and recent entries.
+
+    This is a direct data display (like /tasks or /agenda) — no LLM call.
+    Shows 7-day and 30-day averages plus the last 5 mood log entries.
+    """
+
+    avg_7 = get_mood_average(days=7)
+    avg_30 = get_mood_average(days=30)
+    recent = get_recent_moods(limit=5)
+
+    # If there's no mood data at all, say so and bail
+    if avg_7 is None and avg_30 is None and not recent:
+        await update.message.reply_text(
+            "No mood data logged yet — try `/mood 7 feeling good` to get started!",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["📊 *Mood Summary*\n"]
+
+    # --- Averages section ---
+    # Only show a period if it actually has data (skip rather than show "None")
+    if avg_7 is not None or avg_30 is not None:
+        if avg_7 is not None:
+            lines.append(f"  Last 7 days:  *{avg_7}/10*")
+        if avg_30 is not None:
+            lines.append(f"  Last 30 days: *{avg_30}/10*")
+        lines.append("")  # blank line before entries
+
+    # --- Recent entries section ---
+    if recent:
+        lines.append("📝 *Recent entries:*")
+        for mood in recent:
+            # Parse created_at into a short friendly date (e.g. "Jul 22")
+            created_at = mood.get("created_at", "")
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(created_at)
+                friendly_date = dt.strftime("%b %d")
+            except (ValueError, TypeError):
+                friendly_date = "??"
+
+            note_part = f" — {mood['note']}" if mood.get("note") else ""
+            lines.append(f"  • {friendly_date}: {mood['score']}/10{note_part}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    logger.info("Showed mood stats to %s", update.effective_user.first_name)
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +907,7 @@ def main() -> None:
     app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("agenda", agenda_command))  # Calendar agenda
     app.add_handler(CommandHandler("mood", mood_command))       # Mood tracking
+    app.add_handler(CommandHandler("moodstats", moodstats_command))  # Mood summary
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))  # Gemini chat
 
     # Start polling — the bot will keep running until you press Ctrl+C

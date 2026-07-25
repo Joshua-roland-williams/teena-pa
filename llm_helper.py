@@ -613,6 +613,15 @@ def detect_intent(
         "     - Short replies to a \"how are you?\" question (\"fine\", \"good\")\n"
         "     - Neutral statements, questions, or task/calendar messages\n"
         "     - Emotional words used in a non-mood context (\"I love pizza\")\n"
+        # Questions about mood *history* or *trends* (e.g. "how have I been
+        # feeling lately?", "what's my mood been like?") are NOT log_mood —
+        # they don't express a current mood to log.  Classify as chat so
+        # generate_reply() can answer using the RECENT MOOD context it
+        # already has.
+        "     - Questions about mood patterns/trends/history (e.g. \"how have "
+        "I been feeling lately\", \"what's my mood average\") — these ask "
+        "ABOUT mood, they don't express a current mood to log. Classify as "
+        "chat instead.\n"
         '   When in doubt, fall back to {"intent": "chat"} — never guess a '
         "mood the user didn't actually express.\n\n"
         "7. For ANYTHING else (greetings, questions, general chat), respond:\n"
