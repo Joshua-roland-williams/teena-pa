@@ -377,9 +377,12 @@ def get_recent_moods(limit: int = 7) -> list[dict]:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        # Secondary sort by id ensures a deterministic order when multiple
+        # entries share the same created_at timestamp (e.g. several moods
+        # logged within the same second).
         cursor.execute(
             "SELECT id, score, note, created_at FROM mood_logs "
-            "ORDER BY created_at DESC LIMIT ?;",
+            "ORDER BY created_at DESC, id DESC LIMIT ?;",
             (limit,),
         )
 
