@@ -37,7 +37,7 @@ from database import (
     init_db, add_task, get_open_tasks, mark_task_done, delete_task,
     get_completed_tasks, get_tasks_completed_today, save_message,
     get_recent_messages, log_mood, get_recent_moods, get_mood_average,
-    save_chat_id, get_chat_id,
+    save_chat_id, get_chat_id, APP_TZ,
     # Proactive conversation state
     get_proactive_state, start_proactive_session,
     increment_proactive_exchanges, end_proactive_session,
@@ -52,11 +52,14 @@ from calendar_helper import get_today_events, get_upcoming_events, create_event,
 # scheduled check-ins, and proactive messaging
 from llm_helper import (
     generate_reply, detect_intent, generate_daily_schedule,
-    generate_evening_wrapup,
+    generate_checkin_message,
     # Proactive conversation
     generate_proactive_opener, generate_proactive_reply,
     generate_proactive_exit,
 )
+
+# Import the check-in handlers from the dedicated module
+from checkins import morning_checkin, evening_checkin
 
 
 # ---------------------------------------------------------------------------
@@ -1041,105 +1044,47 @@ async def _send_updated_schedule(
 # ---------------------------------------------------------------------------
 # Scheduled (proactive) check-in jobs
 # ---------------------------------------------------------------------------
-# These run on PTB's built-in JobQueue (which wraps APScheduler internally
-# and ties jobs to PTB's own event loop).  Using a standalone
-# AsyncIOScheduler would bind to a *different* event loop from the one
-# app.run_polling() creates, causing jobs to silently never fire.
+# morning_checkin() and evening_checkin() live in checkins.py and are
+# imported at the top of this file.  They run on PTB's built-in JobQueue
+# (backed by APScheduler) via tz-aware run_daily calls registered in main().
 #
-# Because there's no incoming Update object, these jobs retrieve the
-# chat ID from the database (saved by the /start handler) and use
-# context.bot.send_message() to push messages proactively.
+# /testcheckin is a hidden command that triggers them immediately for
+# testing without waiting for the scheduled time.
 
-async def morning_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def testcheckin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Proactive morning check-in — runs daily at 08:00 local time.
+    Handle /testcheckin morning|evening — trigger a check-in immediately.
 
-    Generates a full daily schedule combining today's calendar events
-    with open tasks, distributed into time blocks.  The schedule is
-    LLM-generated for a natural, personalised timetable.
+    Hidden testing command.  Runs the real check-in handler as if the
+    scheduled job fired, so the output is identical to what the user
+    would see at the scheduled time.
     """
-    chat_id = get_chat_id()
-
-    if chat_id is None:
-        logger.warning("morning_checkin: no chat_id saved yet — skipping.")
+    saved_chat_id = get_chat_id()
+    if update.effective_chat is None or update.effective_chat.id != saved_chat_id:
         return
 
-    try:
-        # Gather all the context the schedule generator needs
-        open_tasks = get_open_tasks()
-        today_events = get_today_events()
-        recent_moods = get_recent_moods(limit=7)
-
-        # Generate the full timetable via Gemini
-        schedule = generate_daily_schedule(
-            open_tasks=open_tasks,
-            today_events=today_events,
-            recent_moods=recent_moods,
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/testcheckin morning` or `/testcheckin evening`",
+            parse_mode="Markdown",
         )
-
-        await context.bot.send_message(chat_id=chat_id, text=schedule)
-        save_message("assistant", schedule)
-        logger.info("morning_checkin: sent daily schedule to chat_id=%d", chat_id)
-
-    except Exception as exc:
-        # If schedule generation fails, send a simple fallback so the
-        # user isn't left with nothing.
-        logger.error("morning_checkin failed: %s", exc, exc_info=True)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🌅 Good morning! I had trouble putting your schedule together — try /tasks and /agenda to see what's on your plate today.",
-        )
-
-
-async def evening_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Proactive evening check-in — runs daily at 22:00 local time.
-
-    Generates a warm wrap-up summarising what was accomplished today,
-    what's left for tomorrow, and previews tomorrow's calendar.
-    """
-    chat_id = get_chat_id()
-
-    if chat_id is None:
-        logger.warning("evening_checkin: no chat_id saved yet — skipping.")
         return
 
-    try:
-        # Gather context for the evening wrap-up
-        completed_today = get_tasks_completed_today()
-        remaining_tasks = get_open_tasks()
-        recent_moods = get_recent_moods(limit=7)
+    kind = context.args[0].lower()
 
-        # Fetch tomorrow's calendar events for a preview.
-        # get_upcoming_events(days_ahead=2) gives today + tomorrow;
-        # we filter to only tomorrow's events by checking the date label.
-        try:
-            upcoming = get_upcoming_events(days_ahead=2)
-            tomorrow = datetime.date.today() + datetime.timedelta(days=1)
-            tomorrow_label = tomorrow.strftime("%a, %b %d")
-            tomorrow_events = [
-                e for e in upcoming if e.get("date") == tomorrow_label
-            ]
-        except Exception:
-            tomorrow_events = []
-
-        # Generate the wrap-up via Gemini
-        wrapup = generate_evening_wrapup(
-            completed_today=completed_today,
-            remaining_tasks=remaining_tasks,
-            recent_moods=recent_moods,
-            tomorrow_events=tomorrow_events,
-        )
-
-        await context.bot.send_message(chat_id=chat_id, text=wrapup)
-        save_message("assistant", wrapup)
-        logger.info("evening_checkin: sent wrap-up to chat_id=%d", chat_id)
-
-    except Exception as exc:
-        logger.error("evening_checkin failed: %s", exc, exc_info=True)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🌙 Good night! I had trouble putting the evening summary together, but I hope you had a good day. Rest well! 💙",
+    if kind == "morning":
+        await update.message.reply_text("⏳ Generating morning check-in…")
+        await morning_checkin(context)
+        logger.info("testcheckin: triggered morning check-in for %s", update.effective_user.first_name)
+    elif kind == "evening":
+        await update.message.reply_text("⏳ Generating evening check-in…")
+        await evening_checkin(context)
+        logger.info("testcheckin: triggered evening check-in for %s", update.effective_user.first_name)
+    else:
+        await update.message.reply_text(
+            f"Unknown check-in type `{kind}`.\n"
+            "Use `/testcheckin morning` or `/testcheckin evening`.",
+            parse_mode="Markdown",
         )
 
 
@@ -1349,6 +1294,7 @@ def main() -> None:
     app.add_handler(CommandHandler("agenda", agenda_command))  # Calendar agenda
     app.add_handler(CommandHandler("mood", mood_command))       # Mood tracking
     app.add_handler(CommandHandler("moodstats", moodstats_command))  # Mood summary
+    app.add_handler(CommandHandler("testcheckin", testcheckin_command))  # Hidden: test check-ins
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))  # Gemini chat
 
     # ------------------------------------------------------------------
@@ -1362,7 +1308,7 @@ def main() -> None:
     # On Windows, the `tzdata` package is required for ZoneInfo to
     # find the IANA timezone database (pip install tzdata).
     # ------------------------------------------------------------------
-    IST = ZoneInfo("Asia/Kolkata")
+    IST = APP_TZ
 
     # Morning briefing — daily at 08:00 IST
     app.job_queue.run_daily(

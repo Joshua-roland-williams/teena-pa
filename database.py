@@ -14,10 +14,14 @@ to make sure connections are always properly closed, even if an error occurs.
 
 import sqlite3
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+# Application timezone (IST, UTC+05:30)
+APP_TZ = ZoneInfo("Asia/Kolkata")
 
 # The database file will be created in the same folder as this script.
 # SQLite creates the file automatically if it doesn't exist yet.
@@ -266,10 +270,10 @@ def mark_task_done(task_id):
     with sqlite3.connect(DATABASE_NAME) as conn:
         cursor = conn.cursor()
 
-        # Set done = 1 and stamp the completion time
+        # Set done = 1 and stamp the completion time in APP_TZ
         cursor.execute(
             "UPDATE tasks SET done = 1, completed_at = ? WHERE id = ? AND done = 0;",
-            (datetime.now().isoformat(), task_id),
+            (datetime.now(APP_TZ).isoformat(), task_id),
         )
         conn.commit()
 
@@ -370,18 +374,17 @@ def get_tasks_completed_today() -> list[dict]:
         (earliest completion first) so the list reads chronologically.
     """
 
+    today_str = datetime.now(APP_TZ).strftime("%Y-%m-%d")
     with sqlite3.connect(DATABASE_NAME) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        # date('now', 'localtime') gives today's date in the system's
-        # local timezone.  completed_at is stored as an ISO timestamp
-        # via datetime.now().isoformat(), which is also local time.
-        # For a single-user bot on a local machine this is consistent.
+        # Compare date(completed_at) against today's date in APP_TZ
         cursor.execute(
             "SELECT * FROM tasks WHERE done = 1 AND deleted = 0 "
-            "AND date(completed_at) = date('now', 'localtime') "
-            "ORDER BY completed_at ASC;"
+            "AND date(completed_at) = ? "
+            "ORDER BY completed_at ASC;",
+            (today_str,),
         )
 
         tasks = [dict(row) for row in cursor.fetchall()]

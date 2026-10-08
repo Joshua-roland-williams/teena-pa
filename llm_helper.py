@@ -31,6 +31,8 @@ import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 
+from database import APP_TZ
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -740,6 +742,268 @@ def generate_reply(
             "Sorry, I'm having trouble thinking right now — "
             "try again in a moment. 🙁"
         )
+
+def generate_checkin_message(
+    kind: str,
+    *,
+    open_tasks: list[dict] | None = None,
+    completed_today: list[dict] | None = None,
+    today_events: list[dict] | None = None,
+    tomorrow_events: list[dict] | None = None,
+    recent_moods: list[dict] | None = None,
+    mood_avg_7: float | None = None,
+) -> str:
+    """
+    Generate a morning or evening check-in message using Gemini.
+
+    This is the single entry point that ``checkins.py`` calls for both
+    morning and evening jobs.  The caller gathers real data from the
+    database and calendar, then this function builds the appropriate
+    prompt with honesty guardrails and returns the LLM-generated text.
+
+    Parameters
+    ----------
+    kind : str
+        Either ``"morning"`` or ``"evening"``.
+    open_tasks : list of dict, optional
+        Open tasks from get_open_tasks().
+    completed_today : list of dict, optional
+        Tasks completed today (evening only, from get_tasks_completed_today()).
+    today_events : list of dict, optional
+        Today's calendar events from get_today_events() or
+        get_upcoming_events().
+    tomorrow_events : list of dict, optional
+        Tomorrow's calendar events (evening only).
+    recent_moods : list of dict, optional
+        Recent mood entries from get_recent_moods().
+    mood_avg_7 : float or None, optional
+        7-day mood average for context.
+
+    Returns
+    -------
+    str
+        The check-in message text, or a short fallback on error.
+    """
+    open_tasks = open_tasks or []
+    completed_today = completed_today or []
+    today_events = today_events or []
+    tomorrow_events = tomorrow_events or []
+    recent_moods = recent_moods or []
+
+    # --- Build data blocks for the prompt ---
+    tasks_block = _format_tasks_for_prompt(open_tasks)
+    events_block = _format_events_for_prompt(today_events)
+    mood_block = _format_mood_for_prompt(recent_moods)
+
+    now = datetime.datetime.now(APP_TZ)
+    now_str = now.strftime("%A, %B %d, %Y, %I:%M %p")
+
+    # ------------------------------------------------------------------
+    # Honesty guardrails — shared by BOTH morning and evening prompts
+    # ------------------------------------------------------------------
+    guardrails = (
+        "HONESTY RULES (non-negotiable):\n"
+        "- ONLY reference events and tasks shown in the data sections above. "
+        "NEVER invent, guess, or assume events or tasks that are not listed.\n"
+        "- If there are no events, say plainly that the calendar is clear — "
+        "don't fabricate a schedule.\n"
+        "- If there are no open tasks, say there are none.\n"
+        "- Use 12-hour AM/PM times (e.g. 9:00 AM, 2:30 PM).\n"
+        "- Keep the message under ~5 sentences. Warm, specific, no platitudes.\n"
+    )
+
+    if kind == "morning":
+        # Sort tasks: overdue first, then due today, then by priority
+        today_date_str = now.strftime("%Y-%m-%d")
+
+        overdue = [t for t in open_tasks
+                   if t.get("due_date") and t["due_date"] < today_date_str]
+        due_today = [t for t in open_tasks
+                     if t.get("due_date") and t["due_date"] == today_date_str]
+        high_prio = [t for t in open_tasks
+                     if t.get("priority") == "high"
+                     and t not in overdue and t not in due_today]
+        priority_tasks = (overdue + due_today + high_prio)[:3]
+
+        if priority_tasks:
+            prio_lines = []
+            for t in priority_tasks:
+                tag = ""
+                if t in overdue:
+                    tag = " ⚠️ OVERDUE"
+                elif t in due_today:
+                    tag = " (due today)"
+                prio_lines.append(f"  - {t['text']}{tag}")
+            priority_block = "\n".join(prio_lines)
+        else:
+            priority_block = _format_tasks_for_prompt(open_tasks[:3])
+
+        # Check if latest mood is notably low (≤ 3) and within the last 36 hours
+        mood_note = ""
+        if recent_moods:
+            latest = recent_moods[0]  # newest first
+            is_recent = False
+            if latest.get("created_at"):
+                try:
+                    created_dt = datetime.datetime.fromisoformat(latest["created_at"])
+                    if created_dt.tzinfo is None:
+                        created_dt = created_dt.replace(tzinfo=datetime.timezone.utc)
+                    is_recent = (now - created_dt) <= datetime.timedelta(hours=36)
+                except Exception:
+                    is_recent = False
+
+            if is_recent and isinstance(latest.get("score"), int) and latest["score"] <= 3:
+                note_text = f" — they said: \"{latest['note']}\"" if latest.get("note") else ""
+                mood_note = (
+                    f"\nNOTE: The user's most recent mood was {latest['score']}/10{note_text}. "
+                    "Be extra warm and gentle in tone. Don't explicitly mention "
+                    "the score, but adjust your energy.\n"
+                )
+
+        prompt = (
+            "You are Teena, a warm personal assistant sending a morning "
+            "check-in message via Telegram.\n\n"
+            f"Current date/time: {now_str}\n\n"
+            "TODAY'S CALENDAR EVENTS:\n"
+            f"{events_block}\n\n"
+            "TOP PRIORITY TASKS (overdue/due-today first):\n"
+            f"{priority_block}\n\n"
+            "RECENT MOOD:\n"
+            f"{mood_block}\n"
+            f"{mood_note}\n"
+            f"{guardrails}\n"
+            "INSTRUCTIONS:\n"
+            "Write a brief, warm morning check-in. Include:\n"
+            "1. Summarise today's calendar events (if any) with their "
+            "actual times in 12-hour AM/PM format.\n"
+            "2. Mention the top 1-3 priority tasks — overdue or due-today "
+            "tasks first, then high-priority ones.\n"
+            "3. If there are no events or tasks, say so plainly — don't "
+            "pad with filler.\n"
+            "4. Keep it warm, specific, and under ~5 sentences. "
+            "Start with a 🌅 emoji.\n"
+            "5. Use plain text with emoji. No markdown bold/italic."
+        )
+
+    elif kind == "evening":
+        # Format completed tasks
+        if completed_today:
+            completed_lines = [f"  - {t['text']}" for t in completed_today]
+            completed_block = "\n".join(completed_lines)
+        else:
+            completed_block = "  (Nothing completed today.)"
+
+        # Format tomorrow's events
+        if tomorrow_events:
+            tmrw_lines = []
+            for e in tomorrow_events:
+                if e["start"] == "All day":
+                    tmrw_lines.append(f"  - {e['summary']} (all day)")
+                else:
+                    tmrw_lines.append(
+                        f"  - {e['start']} – {e['end']}  {e['summary']}"
+                    )
+            tomorrow_block = "\n".join(tmrw_lines)
+        else:
+            tomorrow_block = "  (No events scheduled for tomorrow.)"
+
+        # Tasks due today or overdue that are still open
+        today_date_str = now.strftime("%Y-%m-%d")
+        due_or_overdue = [
+            t for t in open_tasks
+            if t.get("due_date") and t["due_date"] <= today_date_str
+        ]
+        if due_or_overdue:
+            lines = []
+            for t in due_or_overdue:
+                tag = " ⚠️ OVERDUE" if t["due_date"] < today_date_str else " (due today)"
+                lines.append(f"  - {t['text']}{tag}")
+            overdue_block = "\n".join(lines)
+        else:
+            overdue_block = "  (No tasks due today or overdue.)"
+
+        remaining_block = _format_tasks_for_prompt(open_tasks)
+
+        prompt = (
+            "You are Teena, a warm personal assistant sending an evening "
+            "check-in message via Telegram.\n\n"
+            f"Today's date: {now.strftime('%A, %B %d, %Y')}\n\n"
+            "TASKS COMPLETED TODAY:\n"
+            f"{completed_block}\n\n"
+            "TASKS DUE TODAY OR OVERDUE (STILL OPEN):\n"
+            f"{overdue_block}\n\n"
+            "REMAINING OPEN TASKS:\n"
+            f"{remaining_block}\n\n"
+            "TOMORROW'S FIRST EVENTS:\n"
+            f"{tomorrow_block}\n\n"
+            "RECENT MOOD:\n"
+            f"{mood_block}\n\n"
+            f"{guardrails}\n"
+            "INSTRUCTIONS:\n"
+            "Write a warm, concise evening wrap-up. Include:\n"
+            "1. Acknowledge tasks completed today by name (ONLY those "
+            "listed in the TASKS COMPLETED TODAY section). If none were "
+            "completed, acknowledge gently — never guilt-trip.\n"
+            "2. Mention remaining open tasks that were due today or overdue (if any), "
+            "but frame them neutrally — NOT as failures. Just note them.\n"
+            "3. Preview tomorrow's first event if one exists.\n"
+            "4. End by asking the user to rate their day from 1-10 so you "
+            "can log it. Say something like 'How would you rate today, "
+            "1 to 10?' (this feeds into mood tracking).\n"
+            "5. Keep it under ~5 sentences. Start with a 🌙 emoji.\n"
+            "6. Use plain text with emoji. No markdown bold/italic."
+        )
+    else:
+        raise ValueError(f"kind must be 'morning' or 'evening', got {kind!r}")
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        message = response.text.strip()
+        logger.info("Generated %s check-in (%d chars)", kind, len(message))
+        return message
+
+    except Exception as exc:
+        logger.error("Failed to generate %s check-in: %s", kind, exc, exc_info=True)
+        # --- Fallback messages built from real data, never invented ---
+        if kind == "morning":
+            lines = ["🌅 Good morning!\n"]
+            if today_events:
+                lines.append("📅 Today's calendar:")
+                for e in today_events:
+                    if e["start"] == "All day":
+                        lines.append(f"  • {e['summary']} (all day)")
+                    else:
+                        lines.append(f"  • {e['start']} – {e['end']}  {e['summary']}")
+                lines.append("")
+            else:
+                lines.append("📅 No events on the calendar today.\n")
+            if open_tasks:
+                lines.append("📋 Top tasks:")
+                for t in open_tasks[:3]:
+                    due = f" (due {t['due_date']})" if t.get("due_date") else ""
+                    lines.append(f"  • {t['text']}{due}")
+            else:
+                lines.append("📋 No open tasks — clear day!")
+            lines.append("\nHave a great day! ✨")
+            return "\n".join(lines)
+        else:
+            lines = ["🌙 Evening wrap-up:\n"]
+            if completed_today:
+                lines.append("✅ Completed today:")
+                for t in completed_today:
+                    lines.append(f"  • {t['text']}")
+                lines.append("")
+            if open_tasks:
+                lines.append("📋 Still open:")
+                for t in open_tasks[:3]:
+                    lines.append(f"  • {t['text']}")
+                lines.append("")
+            if tomorrow_events:
+                lines.append(f"📅 Tomorrow starts with: {tomorrow_events[0].get('summary', 'an event')}")
+                lines.append("")
+            lines.append("How would you rate today, 1 to 10? 💙")
+            return "\n".join(lines)
 
 
 def generate_daily_schedule(

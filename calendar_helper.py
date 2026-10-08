@@ -238,6 +238,7 @@ def get_upcoming_events(days_ahead: int = 7) -> list[dict]:
             "start": start_str,
             "end": end_str,
             "date": date_label,
+            "date_obj": event_date,
         })
 
     return parsed
