@@ -19,6 +19,8 @@ Uses python-telegram-bot v21.x (async style) with polling.
 import datetime
 import logging
 import os
+from zoneinfo import ZoneInfo
+import random
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -31,14 +33,31 @@ from telegram.ext import (
 )
 
 # Import our database helpers from database.py
-from database import init_db, add_task, get_open_tasks, mark_task_done, delete_task, get_completed_tasks, save_message, get_recent_messages, log_mood, get_recent_moods, get_mood_average
+from database import (
+    init_db, add_task, get_open_tasks, mark_task_done, delete_task,
+    get_completed_tasks, get_tasks_completed_today, save_message,
+    get_recent_messages, log_mood, get_recent_moods, get_mood_average,
+    save_chat_id, get_chat_id,
+    # Proactive conversation state
+    get_proactive_state, start_proactive_session,
+    increment_proactive_exchanges, end_proactive_session,
+    update_proactive_expiry, get_proactive_today_count,
+)
 
 # Import the Google Calendar helper for the /agenda command, event creation,
 # event rescheduling, and upcoming-week context for chat replies
 from calendar_helper import get_today_events, get_upcoming_events, create_event, update_event
 
-# Import the Gemini LLM helper for conversational chat and intent detection
-from llm_helper import generate_reply, detect_intent
+# Import the Gemini LLM helper for conversational chat, intent detection,
+# scheduled check-ins, and proactive messaging
+from llm_helper import (
+    generate_reply, detect_intent, generate_daily_schedule,
+    generate_evening_wrapup,
+    # Proactive conversation
+    generate_proactive_opener, generate_proactive_reply,
+    generate_proactive_exit,
+)
+
 
 # ---------------------------------------------------------------------------
 # 1. Load environment variables from .env
@@ -68,6 +87,10 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the /start command — greet the user."""
+    # Persist the chat ID so scheduled (proactive) jobs can send messages
+    # later without an incoming Update object to pull it from.
+    save_chat_id(update.effective_chat.id)
+
     user_first_name = update.effective_user.first_name
     welcome_text = (
         f"Hey {user_first_name}! 👋\n\n"
@@ -124,6 +147,9 @@ async def addtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode="Markdown",
     )
     logger.info("User %s added task #%d: %s", update.effective_user.first_name, task_id, task_text)
+
+    # Refresh the daily schedule so the new task is reflected immediately.
+    await _send_updated_schedule(update.effective_chat.id, context)
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,6 +435,80 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Step 1 — Persist the incoming user message
     save_message("user", user_text)
 
+    # ------------------------------------------------------------------
+    # Step 1.5 — Check if a proactive conversation is active
+    # ------------------------------------------------------------------
+    # If Teena initiated a casual conversation and we're mid-session,
+    # route this reply through the proactive pipeline instead of
+    # normal intent detection.  This keeps the "girlfriend texting"
+    # vibe separate from the "PA assistant" flow.
+    proactive_state = get_proactive_state()
+
+    if proactive_state["status"] == "active":
+        # Cancel any pending timeout job — the user replied in time
+        current_jobs = context.job_queue.get_jobs_by_name("proactive_timeout")
+        for job in current_jobs:
+            job.schedule_removal()
+
+        # Increment exchange counter
+        new_count = increment_proactive_exchanges()
+        max_ex = proactive_state["max_exchanges"]
+
+        # Build the proactive conversation history from recent messages.
+        # We need messages since the session started — use the started_at
+        # timestamp to scope them.
+        recent = get_recent_messages(limit=20)
+
+        # Filter to messages that occurred during this proactive session
+        started_at = proactive_state.get("started_at")
+        if started_at:
+            proactive_history = []
+            for msg in recent:
+                # All messages from the recent batch are candidates;
+                # the session is short (a few minutes) so the last
+                # several messages are the ones we need.
+                proactive_history.append(msg)
+            # Just take the last few messages as session context
+            proactive_history = recent[-(new_count * 2 + 1):]
+        else:
+            proactive_history = recent[-5:]
+
+        # Generate Teena's reply (includes exit line if final exchange)
+        reply = generate_proactive_reply(
+            user_reply=user_text,
+            proactive_history=proactive_history,
+            exchange_count=new_count,
+            max_exchanges=max_ex,
+            user_name=user_name,
+        )
+
+        await update.message.reply_text(reply)
+        save_message("assistant", reply)
+
+        if new_count >= max_ex:
+            # Session is over — Teena has exited
+            end_proactive_session()
+            logger.info(
+                "Proactive session ended naturally after %d exchanges with %s",
+                new_count, user_name,
+            )
+        else:
+            # Extend the timeout — user has another window to reply
+            update_proactive_expiry()
+            context.job_queue.run_once(
+                _proactive_timeout,
+                when=240,  # 4 minutes
+                name="proactive_timeout",
+            )
+            logger.info(
+                "Proactive exchange %d/%d with %s — reset timeout",
+                new_count, max_ex, user_name,
+            )
+
+        # Skip normal intent detection — this message was part of the
+        # proactive conversation, not a task/event request.
+        return
+
     # Step 2 — Gather context for the LLM
     open_tasks = get_open_tasks()
     recent_messages = get_recent_messages(limit=10)
@@ -469,6 +569,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Intent add_task from %s — created task #%d: %s",
             user_name, new_id, task_text,
         )
+
+        # Refresh the daily schedule so the new task is reflected immediately.
+        await _send_updated_schedule(update.effective_chat.id, context)
 
     elif intent == "complete_task":
         # ---- COMPLETE TASK intent ----
@@ -884,6 +987,344 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Chat with %s — user: %s | reply: %s", user_name, user_text[:80], reply[:80])
 
 # ---------------------------------------------------------------------------
+# Schedule refresh helper
+# ---------------------------------------------------------------------------
+# Called after any task addition (via /addtask or natural-language intent)
+# to regenerate and send the daily schedule so the new task is slotted in.
+
+async def _send_updated_schedule(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Regenerate the daily schedule and send it to the user.
+
+    Called automatically after a task is added so the timetable stays
+    current.  Time-gated to 8 AM – 10 PM to avoid spamming the user
+    with schedule updates in the middle of the night.
+
+    Parameters
+    ----------
+    chat_id : int
+        The Telegram chat ID to send the schedule to.
+    context : ContextTypes.DEFAULT_TYPE
+        PTB callback context (provides access to context.bot).
+    """
+    now = datetime.datetime.now()
+
+    # Only send schedule refreshes during reasonable hours.
+    if not (8 <= now.hour < 22):
+        logger.info("_send_updated_schedule: outside 8 AM–10 PM, skipping.")
+        return
+
+    try:
+        open_tasks = get_open_tasks()
+        today_events = get_today_events()
+        recent_moods = get_recent_moods(limit=3)
+
+        schedule = generate_daily_schedule(
+            open_tasks=open_tasks,
+            today_events=today_events,
+            recent_moods=recent_moods,
+        )
+
+        await context.bot.send_message(chat_id=chat_id, text=f"📋 Updated schedule:\n\n{schedule}")
+        save_message("assistant", f"📋 Updated schedule:\n\n{schedule}")
+        logger.info("_send_updated_schedule: sent refreshed schedule to chat_id=%d", chat_id)
+
+    except Exception as exc:
+        # Never let a schedule refresh crash the main flow — this is
+        # supplementary, not critical.
+        logger.error("_send_updated_schedule failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled (proactive) check-in jobs
+# ---------------------------------------------------------------------------
+# These run on PTB's built-in JobQueue (which wraps APScheduler internally
+# and ties jobs to PTB's own event loop).  Using a standalone
+# AsyncIOScheduler would bind to a *different* event loop from the one
+# app.run_polling() creates, causing jobs to silently never fire.
+#
+# Because there's no incoming Update object, these jobs retrieve the
+# chat ID from the database (saved by the /start handler) and use
+# context.bot.send_message() to push messages proactively.
+
+async def morning_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Proactive morning check-in — runs daily at 08:00 local time.
+
+    Generates a full daily schedule combining today's calendar events
+    with open tasks, distributed into time blocks.  The schedule is
+    LLM-generated for a natural, personalised timetable.
+    """
+    chat_id = get_chat_id()
+
+    if chat_id is None:
+        logger.warning("morning_checkin: no chat_id saved yet — skipping.")
+        return
+
+    try:
+        # Gather all the context the schedule generator needs
+        open_tasks = get_open_tasks()
+        today_events = get_today_events()
+        recent_moods = get_recent_moods(limit=7)
+
+        # Generate the full timetable via Gemini
+        schedule = generate_daily_schedule(
+            open_tasks=open_tasks,
+            today_events=today_events,
+            recent_moods=recent_moods,
+        )
+
+        await context.bot.send_message(chat_id=chat_id, text=schedule)
+        save_message("assistant", schedule)
+        logger.info("morning_checkin: sent daily schedule to chat_id=%d", chat_id)
+
+    except Exception as exc:
+        # If schedule generation fails, send a simple fallback so the
+        # user isn't left with nothing.
+        logger.error("morning_checkin failed: %s", exc, exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🌅 Good morning! I had trouble putting your schedule together — try /tasks and /agenda to see what's on your plate today.",
+        )
+
+
+async def evening_checkin(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Proactive evening check-in — runs daily at 22:00 local time.
+
+    Generates a warm wrap-up summarising what was accomplished today,
+    what's left for tomorrow, and previews tomorrow's calendar.
+    """
+    chat_id = get_chat_id()
+
+    if chat_id is None:
+        logger.warning("evening_checkin: no chat_id saved yet — skipping.")
+        return
+
+    try:
+        # Gather context for the evening wrap-up
+        completed_today = get_tasks_completed_today()
+        remaining_tasks = get_open_tasks()
+        recent_moods = get_recent_moods(limit=7)
+
+        # Fetch tomorrow's calendar events for a preview.
+        # get_upcoming_events(days_ahead=2) gives today + tomorrow;
+        # we filter to only tomorrow's events by checking the date label.
+        try:
+            upcoming = get_upcoming_events(days_ahead=2)
+            tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+            tomorrow_label = tomorrow.strftime("%a, %b %d")
+            tomorrow_events = [
+                e for e in upcoming if e.get("date") == tomorrow_label
+            ]
+        except Exception:
+            tomorrow_events = []
+
+        # Generate the wrap-up via Gemini
+        wrapup = generate_evening_wrapup(
+            completed_today=completed_today,
+            remaining_tasks=remaining_tasks,
+            recent_moods=recent_moods,
+            tomorrow_events=tomorrow_events,
+        )
+
+        await context.bot.send_message(chat_id=chat_id, text=wrapup)
+        save_message("assistant", wrapup)
+        logger.info("evening_checkin: sent wrap-up to chat_id=%d", chat_id)
+
+    except Exception as exc:
+        logger.error("evening_checkin failed: %s", exc, exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🌙 Good night! I had trouble putting the evening summary together, but I hope you had a good day. Rest well! 💙",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Proactive "girlfriend" message jobs
+# ---------------------------------------------------------------------------
+# Teena randomly initiates casual conversations 2-3 times per day.
+# She sends an opener, has a short back-and-forth (1-3 exchanges),
+# then naturally exits with a realistic excuse.
+#
+# The scheduling uses run_once() with random delays to feel natural.
+# Each message callback schedules the next one, and a daily counter
+# caps the total at PROACTIVE_DAILY_MAX messages per day.
+
+PROACTIVE_DAILY_MAX = 3  # Adjustable — max proactive messages per day
+PROACTIVE_WINDOW_START = 10  # Earliest hour (10 AM)
+PROACTIVE_WINDOW_END = 20    # Latest hour (8 PM)
+
+
+async def proactive_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Send a proactive conversation opener and start a multi-turn session.
+
+    This fires at a random time (scheduled by _schedule_next_proactive).
+    It generates a casual opener, sends it, starts a proactive DB session,
+    and sets a timeout for when the user doesn't reply.
+    """
+    chat_id = get_chat_id()
+
+    if chat_id is None:
+        logger.warning("proactive_message: no chat_id saved yet — skipping.")
+        _schedule_next_proactive(context)
+        return
+
+    # Check if we've hit the daily cap
+    today_count = get_proactive_today_count()
+    if today_count >= PROACTIVE_DAILY_MAX:
+        logger.info(
+            "proactive_message: daily cap reached (%d/%d), done for today.",
+            today_count, PROACTIVE_DAILY_MAX,
+        )
+        return
+
+    # Check we're still within the allowed time window
+    now = datetime.datetime.now()
+    if not (PROACTIVE_WINDOW_START <= now.hour < PROACTIVE_WINDOW_END):
+        logger.info(
+            "proactive_message: outside window (%d:00–%d:00), skipping.",
+            PROACTIVE_WINDOW_START, PROACTIVE_WINDOW_END,
+        )
+        _schedule_next_proactive(context)
+        return
+
+    # Don't start a new session if one is already active (safety guard)
+    state = get_proactive_state()
+    if state["status"] == "active":
+        logger.info("proactive_message: session already active, skipping.")
+        _schedule_next_proactive(context)
+        return
+
+    try:
+        # Gather context for the opener
+        recent_messages = get_recent_messages(limit=6)
+        recent_moods = get_recent_moods(limit=3)
+
+        # Generate the opener
+        opener = generate_proactive_opener(
+            recent_messages=recent_messages,
+            recent_moods=recent_moods,
+            user_name="babe",  # Will be replaced with real name if available
+        )
+
+        # Send the opener
+        await context.bot.send_message(chat_id=chat_id, text=opener)
+        save_message("assistant", opener)
+
+        # Start the proactive session in the database
+        max_exchanges = random.randint(2, 3)
+        start_proactive_session(max_exchanges=max_exchanges)
+
+        # Set a timeout — if user doesn't reply within 4 minutes,
+        # Teena sends an exit message and closes the session.
+        context.job_queue.run_once(
+            _proactive_timeout,
+            when=240,  # 4 minutes
+            name="proactive_timeout",
+        )
+
+        logger.info(
+            "proactive_message: sent opener to chat_id=%d, max_exchanges=%d",
+            chat_id, max_exchanges,
+        )
+
+    except Exception as exc:
+        logger.error("proactive_message failed: %s", exc, exc_info=True)
+
+    # Schedule the next proactive message
+    _schedule_next_proactive(context)
+
+
+async def _proactive_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle timeout when the user doesn't reply to a proactive message.
+
+    Sends a casual exit message ("guess you're busy") and closes
+    the proactive session.
+    """
+    # Check if the session is still active — the user might have
+    # replied just before this timeout fired.
+    state = get_proactive_state()
+    if state["status"] != "active":
+        logger.info("_proactive_timeout: session no longer active, skipping.")
+        return
+
+    chat_id = get_chat_id()
+    if chat_id is None:
+        end_proactive_session()
+        return
+
+    try:
+        exit_msg = generate_proactive_exit(user_name="babe")
+        await context.bot.send_message(chat_id=chat_id, text=exit_msg)
+        save_message("assistant", exit_msg)
+        logger.info("_proactive_timeout: sent exit message to chat_id=%d", chat_id)
+
+    except Exception as exc:
+        logger.error("_proactive_timeout failed: %s", exc, exc_info=True)
+
+    # Always end the session, even if sending failed
+    end_proactive_session()
+
+
+def _schedule_next_proactive(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Schedule the next proactive message at a random future time.
+
+    Uses run_once() with a random delay (2–4 hours) so messages
+    feel spontaneous.  Respects the daily cap and time window.
+    """
+    # Check if we've already hit the daily cap
+    today_count = get_proactive_today_count()
+    if today_count >= PROACTIVE_DAILY_MAX:
+        logger.info(
+            "_schedule_next_proactive: daily cap reached (%d/%d), "
+            "not scheduling more for today.",
+            today_count, PROACTIVE_DAILY_MAX,
+        )
+        return
+
+    # Pick a random delay: 2–4 hours (in seconds)
+    delay_hours = random.uniform(2.0, 4.0)
+    delay_seconds = int(delay_hours * 3600)
+
+    # Check if the resulting time would be within the allowed window
+    now = datetime.datetime.now()
+    target_time = now + datetime.timedelta(seconds=delay_seconds)
+
+    if target_time.hour >= PROACTIVE_WINDOW_END:
+        # Would fire too late — don't schedule.  The morning check-in
+        # or next bot restart will re-seed the schedule.
+        logger.info(
+            "_schedule_next_proactive: target time %s is past %d:00, "
+            "not scheduling.",
+            target_time.strftime("%H:%M"), PROACTIVE_WINDOW_END,
+        )
+        return
+
+    # Cancel any existing scheduled proactive jobs to avoid duplicates
+    existing = context.job_queue.get_jobs_by_name("proactive_message")
+    for job in existing:
+        job.schedule_removal()
+
+    context.job_queue.run_once(
+        proactive_message,
+        when=delay_seconds,
+        name="proactive_message",
+    )
+
+    logger.info(
+        "_schedule_next_proactive: next message in %.1f hours (at ~%s)",
+        delay_hours, target_time.strftime("%I:%M %p"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 4. Build the application and start polling
 # ---------------------------------------------------------------------------
 
@@ -909,6 +1350,47 @@ def main() -> None:
     app.add_handler(CommandHandler("mood", mood_command))       # Mood tracking
     app.add_handler(CommandHandler("moodstats", moodstats_command))  # Mood summary
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))  # Gemini chat
+
+    # ------------------------------------------------------------------
+    # Proactive scheduler — PTB's built-in JobQueue (backed by APScheduler
+    # internally) ensures jobs run on the SAME event loop as run_polling(),
+    # avoiding the silent-no-fire bug of a standalone AsyncIOScheduler.
+    #
+    # IMPORTANT: datetime.time() without tzinfo is treated as UTC by
+    # PTB's JobQueue, NOT local time.  We use ZoneInfo("Asia/Kolkata")
+    # (IST, UTC+05:30) so jobs fire at the intended wall-clock hour.
+    # On Windows, the `tzdata` package is required for ZoneInfo to
+    # find the IANA timezone database (pip install tzdata).
+    # ------------------------------------------------------------------
+    IST = ZoneInfo("Asia/Kolkata")
+
+    # Morning briefing — daily at 08:00 IST
+    app.job_queue.run_daily(
+        morning_checkin,
+        time=datetime.time(hour=8, minute=0, tzinfo=IST),
+        name="morning_checkin",
+    )
+
+    # Evening wrap-up — daily at 21:00 IST
+    app.job_queue.run_daily(
+        evening_checkin,
+        time=datetime.time(hour=21, minute=0, tzinfo=IST),
+        name="evening_checkin",
+    )
+
+    # ------------------------------------------------------------------
+    # Proactive "girlfriend" messages — randomized 2-3 times per day.
+    # We seed the first one at startup; each message callback schedules
+    # the next one automatically.
+    # ------------------------------------------------------------------
+    # Clean up any stale proactive sessions from a previous run
+    state = get_proactive_state()
+    if state["status"] == "active":
+        end_proactive_session()
+        logger.info("Cleaned up stale proactive session from previous run.")
+
+    # Schedule the first proactive message (random delay from now)
+    _schedule_next_proactive(app.job_queue)
 
     # Start polling — the bot will keep running until you press Ctrl+C
     logger.info("Bot is polling for updates… Press Ctrl+C to stop.")

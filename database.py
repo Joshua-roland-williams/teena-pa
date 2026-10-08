@@ -13,7 +13,7 @@ to make sure connections are always properly closed, even if an error occurs.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -123,6 +123,49 @@ def init_db():
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+
+        # --- bot_config table ---
+        # A simple key-value store for bot-wide settings (e.g. the
+        # Telegram chat ID).  Scheduled / proactive jobs need the
+        # chat ID persisted here because they run without an incoming
+        # Update object, so there's no update.effective_chat.id to
+        # read from at send time.
+        #   • key   – unique config name (e.g. "chat_id")
+        #   • value – the config value stored as text
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_config (
+                key    TEXT PRIMARY KEY,
+                value  TEXT NOT NULL
+            );
+        """)
+
+        # --- proactive_state table ---
+        # Tracks the state of proactive multi-turn conversations.
+        # Teena initiates casual conversations 2-3 times per day;
+        # this table manages the session lifecycle (idle → active →
+        # exiting → idle) and enforces the daily message cap.
+        #
+        # Only ONE row ever exists (id = 1); we use INSERT OR REPLACE
+        # to upsert it.  This is simpler than a key-value approach
+        # for structured state with multiple related fields.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_state (
+                id             INTEGER PRIMARY KEY DEFAULT 1,
+                status         TEXT    NOT NULL DEFAULT 'idle',
+                exchanges      INTEGER NOT NULL DEFAULT 0,
+                max_exchanges  INTEGER NOT NULL DEFAULT 3,
+                started_at     TIMESTAMP,
+                expires_at     TIMESTAMP,
+                today_count    INTEGER NOT NULL DEFAULT 0,
+                last_date      TEXT
+            );
+        """)
+
+        # Ensure exactly one row exists in proactive_state so all
+        # helpers can read/update it without INSERT-vs-UPDATE logic.
+        cursor.execute(
+            "INSERT OR IGNORE INTO proactive_state (id) VALUES (1);"
+        )
 
         # Commit is handled automatically by the context manager,
         # but calling it explicitly makes the intent crystal clear.
@@ -312,6 +355,40 @@ def get_completed_tasks(limit: int = 10) -> list[dict]:
     return tasks
 
 
+def get_tasks_completed_today() -> list[dict]:
+    """
+    Fetch tasks that were completed today (done = 1, completed_at is today).
+
+    Used by the evening wrap-up to show what the user accomplished during
+    the current day — more focused than get_completed_tasks() which spans
+    all time.  Excludes soft-deleted tasks.
+
+    Returns
+    -------
+    list of dict
+        Each dict has all task columns.  Ordered by completed_at ascending
+        (earliest completion first) so the list reads chronologically.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # date('now', 'localtime') gives today's date in the system's
+        # local timezone.  completed_at is stored as an ISO timestamp
+        # via datetime.now().isoformat(), which is also local time.
+        # For a single-user bot on a local machine this is consistent.
+        cursor.execute(
+            "SELECT * FROM tasks WHERE done = 1 AND deleted = 0 "
+            "AND date(completed_at) = date('now', 'localtime') "
+            "ORDER BY completed_at ASC;"
+        )
+
+        tasks = [dict(row) for row in cursor.fetchall()]
+
+    return tasks
+
+
 # ---------------------------------------------------------------------------
 # Mood logging helper functions
 # ---------------------------------------------------------------------------
@@ -487,6 +564,297 @@ def get_recent_messages(limit: int = 10) -> list[dict]:
     # Reverse so oldest message comes first (chronological order)
     rows.reverse()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Bot config helper functions (chat ID persistence)
+# ---------------------------------------------------------------------------
+# Scheduled (proactive) messages — like morning briefings or reminders —
+# need to know which Telegram chat to send to.  Unlike command or message
+# handlers, scheduled jobs don't receive an incoming Update object, so
+# there's no update.effective_chat.id available at send time.  We solve
+# this by capturing the chat ID when the user first interacts with the
+# bot (via /start) and persisting it in the bot_config table.
+
+def save_chat_id(chat_id: int) -> None:
+    """
+    Persist the Telegram chat ID so scheduled jobs can retrieve it later.
+
+    Uses INSERT OR REPLACE so the first call creates the row and
+    subsequent calls simply update the value — no need for separate
+    "does the row already exist?" logic.
+
+    Parameters
+    ----------
+    chat_id : int
+        The Telegram chat ID to save.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO bot_config (key, value) VALUES (?, ?);",
+            ("chat_id", str(chat_id)),
+        )
+        conn.commit()
+
+
+def get_chat_id() -> int | None:
+    """
+    Retrieve the persisted Telegram chat ID.
+
+    Returns
+    -------
+    int or None
+        The saved chat ID as an integer, or None if /start has never
+        been run (i.e. no chat_id row exists in bot_config yet).
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM bot_config WHERE key = ?;",
+            ("chat_id",),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return int(row[0])
+
+
+# ---------------------------------------------------------------------------
+# Generalized config helpers
+# ---------------------------------------------------------------------------
+# These extend the bot_config key-value store beyond just the chat ID.
+# Any bot-wide setting can be persisted here (e.g. proactive message
+# counters, feature flags, user preferences).
+
+def save_config(key: str, value: str) -> None:
+    """
+    Persist a key-value pair in the bot_config table.
+
+    Uses INSERT OR REPLACE so the first call creates the row and
+    subsequent calls update it.
+
+    Parameters
+    ----------
+    key : str
+        The config key (e.g. "proactive_daily_max").
+    value : str
+        The config value (stored as text; caller handles type conversion).
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO bot_config (key, value) VALUES (?, ?);",
+            (key, value),
+        )
+        conn.commit()
+
+
+def get_config(key: str) -> str | None:
+    """
+    Retrieve a config value by key.
+
+    Returns
+    -------
+    str or None
+        The stored value as a string, or None if the key doesn't exist.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM bot_config WHERE key = ?;",
+            (key,),
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return row[0]
+
+
+# ---------------------------------------------------------------------------
+# Proactive conversation state helpers
+# ---------------------------------------------------------------------------
+# These manage the lifecycle of Teena's proactive multi-turn conversations.
+# The proactive_state table has exactly ONE row (id=1) that tracks:
+#   - status: 'idle' | 'active' | 'exiting'
+#   - exchanges: how many back-and-forths in the current session
+#   - max_exchanges: random 2-3, chosen when session starts
+#   - started_at / expires_at: timing for the current session
+#   - today_count: how many proactive messages sent today (2-3 cap)
+#   - last_date: date string for auto-resetting today_count
+
+def get_proactive_state() -> dict:
+    """
+    Fetch the current proactive conversation state.
+
+    Automatically resets today_count when the date has changed
+    (i.e. a new day has started since the last proactive message).
+
+    Returns
+    -------
+    dict
+        Keys: status, exchanges, max_exchanges, started_at,
+        expires_at, today_count, last_date.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM proactive_state WHERE id = 1;")
+        row = cursor.fetchone()
+
+    if row is None:
+        # Shouldn't happen (init_db seeds the row), but be safe
+        return {
+            "status": "idle",
+            "exchanges": 0,
+            "max_exchanges": 3,
+            "started_at": None,
+            "expires_at": None,
+            "today_count": 0,
+            "last_date": None,
+        }
+
+    state = dict(row)
+
+    # Auto-reset the daily counter if the date has rolled over
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if state.get("last_date") != today_str:
+        state["today_count"] = 0
+        state["last_date"] = today_str
+        # Persist the reset so it sticks
+        with sqlite3.connect(DATABASE_NAME) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE proactive_state SET today_count = 0, "
+                "last_date = ? WHERE id = 1;",
+                (today_str,),
+            )
+            conn.commit()
+
+    return state
+
+
+def start_proactive_session(max_exchanges: int = 3) -> None:
+    """
+    Begin a new proactive conversation session.
+
+    Sets status to 'active', records the start time, calculates
+    the expiry (4 minutes from now), and increments the daily counter.
+
+    Parameters
+    ----------
+    max_exchanges : int
+        How many back-and-forths before Teena exits (typically 2-3).
+    """
+    now = datetime.now()
+    expires = now + timedelta(minutes=4)
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE proactive_state SET "
+            "status = 'active', "
+            "exchanges = 0, "
+            "max_exchanges = ?, "
+            "started_at = ?, "
+            "expires_at = ?, "
+            "today_count = today_count + 1, "
+            "last_date = ? "
+            "WHERE id = 1;",
+            (max_exchanges, now.isoformat(), expires.isoformat(),
+             now.strftime("%Y-%m-%d")),
+        )
+        conn.commit()
+
+
+def increment_proactive_exchanges() -> int:
+    """
+    Increment the exchange counter for the active proactive session.
+
+    Returns
+    -------
+    int
+        The NEW exchange count after incrementing.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE proactive_state SET exchanges = exchanges + 1 "
+            "WHERE id = 1;"
+        )
+        conn.commit()
+
+        # Fetch the updated count
+        cursor.execute(
+            "SELECT exchanges FROM proactive_state WHERE id = 1;"
+        )
+        row = cursor.fetchone()
+
+    return row[0] if row else 0
+
+
+def end_proactive_session() -> None:
+    """
+    End the current proactive session — reset status to 'idle'.
+
+    Clears the session-specific fields (exchanges, timing) but
+    preserves today_count and last_date for daily cap enforcement.
+    """
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE proactive_state SET "
+            "status = 'idle', "
+            "exchanges = 0, "
+            "started_at = NULL, "
+            "expires_at = NULL "
+            "WHERE id = 1;"
+        )
+        conn.commit()
+
+
+def update_proactive_expiry() -> None:
+    """
+    Extend the proactive session expiry by 4 minutes from now.
+
+    Called when the user replies during an active session — gives
+    them another window to respond before Teena auto-exits.
+    """
+    new_expiry = datetime.now() + timedelta(minutes=4)
+
+    with sqlite3.connect(DATABASE_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE proactive_state SET expires_at = ? WHERE id = 1;",
+            (new_expiry.isoformat(),),
+        )
+        conn.commit()
+
+
+def get_proactive_today_count() -> int:
+    """
+    Get the number of proactive messages sent today.
+
+    Handles daily reset automatically by checking the stored date.
+
+    Returns
+    -------
+    int
+        Number of proactive messages sent today (0 if none or new day).
+    """
+    state = get_proactive_state()  # auto-resets if date changed
+    return state.get("today_count", 0)
 
 
 # ---------------------------------------------------------------------------

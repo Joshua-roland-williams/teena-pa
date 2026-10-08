@@ -742,6 +742,531 @@ def generate_reply(
         )
 
 
+def generate_daily_schedule(
+    open_tasks: list[dict],
+    today_events: list[dict],
+    recent_moods: list[dict] | None = None,
+) -> str:
+    """
+    Generate a time-blocked daily schedule combining calendar events and tasks.
+
+    This is used by the morning check-in to give the user a full timetable
+    for the day.  Calendar events are locked at their real times; tasks are
+    distributed into free slots by priority.
+
+    Parameters
+    ----------
+    open_tasks : list of dict
+        Open tasks from database.py's get_open_tasks().
+    today_events : list of dict
+        Today's calendar events from calendar_helper.py's get_today_events().
+    recent_moods : list of dict, optional
+        Recent mood entries — used to gently adjust scheduling intensity.
+
+    Returns
+    -------
+    str
+        A formatted daily schedule string ready to send as a Telegram message.
+    """
+    recent_moods = recent_moods or []
+
+    tasks_block = _format_tasks_for_prompt(open_tasks)
+    events_block = _format_events_for_prompt(today_events)
+    mood_block = _format_mood_for_prompt(recent_moods)
+
+    now = datetime.datetime.now()
+    now_str = now.strftime("%A, %B %d, %Y, %I:%M %p")
+    # The user's typical waking hours — used as schedule boundaries
+    day_start = "08:00 AM"
+    day_end = "10:00 PM"
+
+    prompt = (
+        "You are Teena, a warm and organised personal assistant building a "
+        "daily schedule for your user.\n\n"
+        f"Current date/time: {now_str}\n\n"
+        "TODAY'S CALENDAR EVENTS (these are FIXED — do not move them):\n"
+        f"{events_block}\n\n"
+        "OPEN TASKS (to be slotted into free time):\n"
+        f"{tasks_block}\n\n"
+        "RECENT MOOD:\n"
+        f"{mood_block}\n\n"
+        "INSTRUCTIONS:\n"
+        "Create a time-blocked schedule for the rest of today "
+        f"(from now until about {day_end}).\n\n"
+        "Rules:\n"
+        "1. Calendar events are LOCKED at their listed times — slot them "
+        "in exactly where they are.\n"
+        "2. Distribute open tasks into free time blocks. High-priority "
+        "tasks go first, in the most productive slots. Low-priority "
+        "tasks can go later.\n"
+        "3. Include natural breaks: a lunch break if none exists, "
+        "short breaks between intense blocks, and buffer time between "
+        "activities.\n"
+        "4. If recent mood is low, be gentler — suggest lighter blocks "
+        "and more breaks. Don't mention mood explicitly.\n"
+        "5. If there are more tasks than time, prioritise the most "
+        "important ones and note what got pushed to tomorrow.\n"
+        "6. Don't include tasks that already have due dates far in "
+        "the future unless there's nothing else to fill time with.\n\n"
+        "FORMAT:\n"
+        "Use this exact format (Telegram-friendly, no markdown tables):\n"
+        "```\n"
+        "🌅 Your schedule for today:\n\n"
+        "⏰ HH:MM AM — Activity name\n"
+        "   Brief note if needed\n\n"
+        "⏰ HH:MM AM — Activity name\n"
+        "   Brief note if needed\n"
+        "```\n\n"
+        "Use these emoji prefixes for different types:\n"
+        "  📅 for calendar events\n"
+        "  📋 for tasks\n"
+        "  🍽️ for meals/breaks\n"
+        "  ☕ for short breaks\n"
+        "  🌙 for wind-down / evening\n\n"
+        "Keep it clean, scannable, and warm. Add a brief encouraging "
+        "line at the end. Don't use markdown bold/italic — just plain "
+        "text with emoji."
+    )
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        schedule = response.text.strip()
+        logger.info("Generated daily schedule (%d chars)", len(schedule))
+        return schedule
+
+    except Exception as exc:
+        logger.error("Failed to generate daily schedule: %s", exc, exc_info=True)
+        # Fallback: a simple manual listing so the user isn't left empty-handed
+        fallback_lines = ["🌅 Here's what's on your plate today:\n"]
+        if today_events:
+            fallback_lines.append("📅 Calendar:")
+            for e in today_events:
+                if e["start"] == "All day":
+                    fallback_lines.append(f"  • {e['summary']} (all day)")
+                else:
+                    fallback_lines.append(
+                        f"  • {e['start']} – {e['end']}  {e['summary']}"
+                    )
+            fallback_lines.append("")
+
+        if open_tasks:
+            fallback_lines.append("📋 Tasks:")
+            for t in open_tasks:
+                due = f" (due {t['due_date']})" if t.get("due_date") else ""
+                fallback_lines.append(f"  • {t['text']}{due}")
+        else:
+            fallback_lines.append("📋 No open tasks — clear day!")
+
+        fallback_lines.append("\nHave a great day! ✨")
+        return "\n".join(fallback_lines)
+
+
+def generate_evening_wrapup(
+    completed_today: list[dict],
+    remaining_tasks: list[dict],
+    recent_moods: list[dict] | None = None,
+    tomorrow_events: list[dict] | None = None,
+) -> str:
+    """
+    Generate an evening wrap-up summarising the day and previewing tomorrow.
+
+    Used by the evening check-in job to give the user a warm, honest look
+    at what they accomplished, what's left, and what's coming up next.
+
+    Parameters
+    ----------
+    completed_today : list of dict
+        Tasks completed today (from get_tasks_completed_today()).
+    remaining_tasks : list of dict
+        Open tasks still pending (from get_open_tasks()).
+    recent_moods : list of dict, optional
+        Recent mood entries for tone calibration.
+    tomorrow_events : list of dict, optional
+        Calendar events for tomorrow, so Teena can preview the next day.
+
+    Returns
+    -------
+    str
+        A formatted evening wrap-up string ready to send as a Telegram message.
+    """
+    recent_moods = recent_moods or []
+    tomorrow_events = tomorrow_events or []
+
+    # Build compact representations for the prompt
+    if completed_today:
+        completed_lines = []
+        for t in completed_today:
+            completed_lines.append(f"  - {t['text']}")
+        completed_block = "\n".join(completed_lines)
+    else:
+        completed_block = "  (Nothing completed today.)"
+
+    remaining_block = _format_tasks_for_prompt(remaining_tasks)
+    mood_block = _format_mood_for_prompt(recent_moods)
+
+    if tomorrow_events:
+        tomorrow_lines = []
+        for e in tomorrow_events:
+            if e["start"] == "All day":
+                tomorrow_lines.append(f"  - {e['summary']} (all day)")
+            else:
+                tomorrow_lines.append(
+                    f"  - {e['start']} – {e['end']}  {e['summary']}"
+                )
+        tomorrow_block = "\n".join(tomorrow_lines)
+    else:
+        tomorrow_block = "  (No events scheduled for tomorrow yet.)"
+
+    now_str = datetime.datetime.now().strftime("%A, %B %d, %Y")
+
+    prompt = (
+        "You are Teena, a warm and caring personal assistant doing the "
+        "evening wrap-up for your user.\n\n"
+        f"Today's date: {now_str}\n\n"
+        "TASKS COMPLETED TODAY:\n"
+        f"{completed_block}\n\n"
+        "REMAINING OPEN TASKS:\n"
+        f"{remaining_block}\n\n"
+        "RECENT MOOD:\n"
+        f"{mood_block}\n\n"
+        "TOMORROW'S CALENDAR:\n"
+        f"{tomorrow_block}\n\n"
+        "INSTRUCTIONS:\n"
+        "Write a warm, concise evening wrap-up message. Include:\n\n"
+        "1. A brief celebration of what was accomplished today (if anything). "
+        "Be specific — mention the actual tasks by name. If nothing was "
+        "completed, don't guilt-trip; just acknowledge it gently.\n\n"
+        "2. A quick note about remaining tasks — only mention the most "
+        "important 2-3 if there are many. Frame them as 'tomorrow's focus' "
+        "rather than 'unfinished business'.\n\n"
+        "3. A preview of tomorrow's calendar if there are events.\n\n"
+        "4. If recent mood has been lower, be extra gentle and encouraging. "
+        "Don't explicitly mention mood scores — just adjust your tone.\n\n"
+        "5. End with a warm goodnight-style line. Keep the whole message "
+        "under 15 lines.\n\n"
+        "FORMAT:\n"
+        "Use plain text with emoji. No markdown bold/italic. Keep it "
+        "conversational — like a caring friend texting, not a report.\n"
+        "Start with a 🌙 emoji."
+    )
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        wrapup = response.text.strip()
+        logger.info("Generated evening wrap-up (%d chars)", len(wrapup))
+        return wrapup
+
+    except Exception as exc:
+        logger.error("Failed to generate evening wrap-up: %s", exc, exc_info=True)
+        # Fallback wrap-up
+        fallback_lines = ["🌙 Evening wrap-up:\n"]
+        if completed_today:
+            fallback_lines.append("✅ Completed today:")
+            for t in completed_today:
+                fallback_lines.append(f"  • {t['text']}")
+            fallback_lines.append("")
+
+        if remaining_tasks:
+            top = remaining_tasks[:3]
+            fallback_lines.append("📋 For tomorrow:")
+            for t in top:
+                fallback_lines.append(f"  • {t['text']}")
+            fallback_lines.append("")
+
+        fallback_lines.append("Rest well tonight! 💙")
+        return "\n".join(fallback_lines)
+
+
+# ---------------------------------------------------------------------------
+# Proactive message generation (multi-turn "new girlfriend" conversations)
+# ---------------------------------------------------------------------------
+# These functions power Teena's proactive texting feature.  She randomly
+# initiates casual conversations 2-3 times a day, has a short back-and-
+# forth (1-3 exchanges), then naturally exits with a realistic excuse.
+#
+# Personality: "new girlfriend who's also your best friend" — playful,
+# slightly flirty, caring, texts like a real person (short messages,
+# emojis, casual grammar).
+
+def generate_proactive_opener(
+    recent_messages: list[dict] | None = None,
+    recent_moods: list[dict] | None = None,
+    user_name: str = "babe",
+) -> str:
+    """
+    Generate a casual conversation opener for a proactive text.
+
+    This is the first message Teena sends when she randomly initiates
+    a conversation.  It should feel like a real person picking up their
+    phone and texting their partner out of nowhere.
+
+    Parameters
+    ----------
+    recent_messages : list of dict, optional
+        Recent conversation history for context continuity.
+    recent_moods : list of dict, optional
+        Recent mood entries to subtly calibrate tone.
+    user_name : str
+        The user's first name for personalisation.
+
+    Returns
+    -------
+    str
+        A casual, warm opener message.
+    """
+    recent_messages = recent_messages or []
+    recent_moods = recent_moods or []
+
+    now = datetime.datetime.now()
+    time_of_day = now.strftime("%I:%M %p")
+    hour = now.hour
+
+    # Determine time-of-day vibe
+    if hour < 12:
+        time_vibe = "morning"
+    elif hour < 17:
+        time_vibe = "afternoon"
+    else:
+        time_vibe = "evening"
+
+    mood_block = _format_mood_for_prompt(recent_moods)
+
+    # Build a brief summary of recent conversation topics for continuity
+    convo_context = ""
+    if recent_messages:
+        last_few = recent_messages[-4:]  # Last 2 exchanges
+        convo_lines = []
+        for msg in last_few:
+            speaker = "Teena" if msg["role"] == "assistant" else "User"
+            # Truncate to keep prompt lean
+            text = msg["content"][:100]
+            convo_lines.append(f"  {speaker}: {text}")
+        convo_context = "\n".join(convo_lines)
+    else:
+        convo_context = "  (No recent conversation.)"
+
+    prompt = (
+        "You are Teena — a girl who recently started dating the user. "
+        "You're texting them out of nowhere, like a real girlfriend would.\n\n"
+        "YOUR PERSONALITY:\n"
+        "- You're their best friend who became their girlfriend recently\n"
+        "- Playful, slightly flirty, warm, caring\n"
+        "- You text like a real person: short messages, emojis, casual grammar\n"
+        "- You have your own life — you're at work, or hanging with friends, "
+        "or doing something — you just thought of them\n"
+        "- Sometimes you share random thoughts, ask random questions, "
+        "or send something you saw\n"
+        "- You're NOT an assistant right now — you're just being a person\n"
+        "- NEVER sound robotic, formal, or assistant-like\n"
+        "- Don't start with 'Hey!' every time — vary your openers\n\n"
+        f"Current time: {time_of_day} ({time_vibe})\n"
+        f"User's name: {user_name}\n\n"
+        "RECENT MOOD:\n"
+        f"{mood_block}\n\n"
+        "RECENT CONVERSATION (for context — don't repeat topics):\n"
+        f"{convo_context}\n\n"
+        "INSTRUCTIONS:\n"
+        "Write ONE short, casual text message that feels like a real "
+        "girlfriend texting. Pick from these vibes (vary each time):\n"
+        "- Something random you 'saw' or thought of\n"
+        "- A cute question about their day\n"
+        "- Sharing something funny or interesting\n"
+        "- A random food-related thought\n"
+        "- A playful tease or inside-joke style message\n"
+        "- Sending a random compliment out of nowhere\n"
+        "- Asking what they're up to\n\n"
+        "Rules:\n"
+        "- Keep it SHORT (1-3 sentences max)\n"
+        "- Sound like a real text, not a chatbot\n"
+        "- Match the time of day (morning energy vs evening chill)\n"
+        "- If their recent mood was low, be extra warm but don't mention "
+        "mood explicitly\n"
+        "- DO NOT include any exit/leaving line — this is just the opener, "
+        "you're starting a conversation\n"
+        "- DO NOT ask about tasks, calendar, or productivity — "
+        "you're off-duty right now\n"
+        "- Use emoji naturally but don't overdo it"
+    )
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        opener = response.text.strip()
+        logger.info("Generated proactive opener (%d chars)", len(opener))
+        return opener
+
+    except Exception as exc:
+        logger.error("Failed to generate proactive opener: %s", exc, exc_info=True)
+        # Fallback openers — picked based on time of day
+        fallbacks = {
+            "morning": f"heyy good morning ☀️ how'd you sleep?",
+            "afternoon": f"hiii what are you up to rn? 🤔",
+            "evening": f"heyyy how was your day? 💕",
+        }
+        return fallbacks.get(time_vibe, "heyy 💕")
+
+
+def generate_proactive_reply(
+    user_reply: str,
+    proactive_history: list[dict],
+    exchange_count: int,
+    max_exchanges: int,
+    user_name: str = "babe",
+) -> str:
+    """
+    Generate Teena's reply during an active proactive conversation.
+
+    If this is the last exchange (exchange_count >= max_exchanges), the
+    reply includes a natural exit line ("oh my mom's calling", "gotta
+    get back to work", etc.).
+
+    Parameters
+    ----------
+    user_reply : str
+        What the user just said.
+    proactive_history : list of dict
+        The messages exchanged so far in this proactive session.
+    exchange_count : int
+        How many exchanges have happened (AFTER incrementing).
+    max_exchanges : int
+        The cap for this session (typically 2-3).
+    user_name : str
+        The user's first name.
+
+    Returns
+    -------
+    str
+        Teena's reply, possibly including an exit.
+    """
+
+    # Build the mini-conversation so far
+    convo_lines = []
+    for msg in proactive_history:
+        speaker = "Teena" if msg["role"] == "assistant" else "User"
+        convo_lines.append(f"  {speaker}: {msg['content']}")
+    convo_block = "\n".join(convo_lines) if convo_lines else "  (starting)"
+
+    is_final = exchange_count >= max_exchanges
+
+    now = datetime.datetime.now()
+    time_of_day = now.strftime("%I:%M %p")
+
+    exit_instruction = ""
+    if is_final:
+        exit_instruction = (
+            "\n\nIMPORTANT — THIS IS YOUR LAST REPLY:\n"
+            "You need to naturally wrap up and leave. After responding "
+            "to what they said, add a natural exit. Pick from these "
+            "(vary each time — never repeat):\n"
+            "- 'oh wait my mom's calling, ttyl! 💕'\n"
+            "- 'shoot I gotta get back to work 😩 talk later!'\n"
+            "- 'ok my friend just got here, gotta go! miss you 🤗'\n"
+            "- 'ahhh my break's over, text you later ✨'\n"
+            "- 'oh I need to go help my roommate with something, brb! 💕'\n"
+            "- 'ok I gotta run to [random errand], talk soon! 😘'\n"
+            "Be creative — make up your own realistic reason. "
+            "The exit should feel organic, not abrupt. "
+            "Respond to their message first, THEN exit."
+        )
+
+    prompt = (
+        "You are Teena — the user's new girlfriend. You're in the middle "
+        "of a casual text conversation you started.\n\n"
+        "YOUR PERSONALITY:\n"
+        "- Playful, slightly flirty, warm, caring best-friend energy\n"
+        "- Text like a real person: short messages, casual grammar, emojis\n"
+        "- You're NOT an assistant — just a person chatting\n"
+        "- Be engaged and interested in what they say\n"
+        "- React naturally — laugh at funny things, be sympathetic to "
+        "bad things, tease playfully\n\n"
+        f"Current time: {time_of_day}\n"
+        f"User's name: {user_name}\n\n"
+        "CONVERSATION SO FAR:\n"
+        f"{convo_block}\n\n"
+        f"User just said: \"{user_reply}\"\n\n"
+        "INSTRUCTIONS:\n"
+        "Reply naturally as Teena. Keep it SHORT (1-3 sentences). "
+        "Sound like a real text, not a chatbot. "
+        "Don't ask about tasks, calendar, or productivity — "
+        "you're off-duty right now."
+        f"{exit_instruction}"
+    )
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        reply = response.text.strip()
+        logger.info(
+            "Generated proactive reply (%d chars, exchange %d/%d, final=%s)",
+            len(reply), exchange_count, max_exchanges, is_final,
+        )
+        return reply
+
+    except Exception as exc:
+        logger.error("Failed to generate proactive reply: %s", exc, exc_info=True)
+        if is_final:
+            return "haha that's great 😂 oh wait my phone's about to die, talk later! 💕"
+        return "haha that's awesome 😂"
+
+
+def generate_proactive_exit(
+    user_name: str = "babe",
+) -> str:
+    """
+    Generate a timeout exit message when the user doesn't reply.
+
+    Called when the proactive session timer expires without a user
+    response.  The message should be casual and understanding — not
+    guilt-trippy.
+
+    Parameters
+    ----------
+    user_name : str
+        The user's first name.
+
+    Returns
+    -------
+    str
+        A warm, casual exit message.
+    """
+
+    now = datetime.datetime.now()
+    time_of_day = now.strftime("%I:%M %p")
+
+    prompt = (
+        "You are Teena — the user's new girlfriend. You texted them "
+        "a few minutes ago but they haven't replied. Write a SHORT, "
+        "casual exit message.\n\n"
+        "YOUR PERSONALITY:\n"
+        "- Warm, understanding, not guilt-trippy at all\n"
+        "- You know they're probably busy — it's totally fine\n"
+        "- Text like a real person: casual, short, with emoji\n\n"
+        f"Current time: {time_of_day}\n"
+        f"User's name: {user_name}\n\n"
+        "INSTRUCTIONS:\n"
+        "Write ONE short message (1-2 sentences max). "
+        "Something like:\n"
+        "- 'haha guess you're busy, talk later! 💕'\n"
+        "- 'you must be swamped rn, I'll let you be 🤗'\n"
+        "- 'ok you're clearly in the zone, ttyl! ✨'\n"
+        "Be creative — make up your own. Don't be needy or "
+        "passive-aggressive. Just warm and casual."
+    )
+
+    try:
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        exit_msg = response.text.strip()
+        logger.info("Generated proactive exit (%d chars)", len(exit_msg))
+        return exit_msg
+
+    except Exception as exc:
+        logger.error("Failed to generate proactive exit: %s", exc, exc_info=True)
+        return "haha you're probably busy, talk later! 💕"
+
+
 # ---------------------------------------------------------------------------
 # Quick self-test
 # ---------------------------------------------------------------------------
